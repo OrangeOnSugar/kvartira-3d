@@ -5,3 +5,5 @@
 Открыть: https://orangeonsugar.github.io/kvartira-3d/
 
 Вся модель — один файл `index.html` (three.js с CDN). Варианты обстановки сохраняются в браузере (localStorage), их можно скачать файлом и загрузить обратно.
+
+Библиотека three.js r147 (MIT) лежит в `lib/`, чтобы сайт не зависел от CDN.
