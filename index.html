@@ -206,6 +206,32 @@ label.btn { display: inline-flex; align-items: center; }
   .cats, .tip { padding-left: 16px; padding-right: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+
+/* Редактор планировки */
+.pe { position: fixed; inset: 0; z-index: 50; display: grid; grid-template-columns: 340px minmax(0, 1fr); background: var(--bg); }
+.pe-side { background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
+.pe-side .sec h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.pe-stage { position: relative; min-width: 0; min-height: 0; background: var(--m-scene); overflow: hidden; }
+.pe-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.pe-hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); max-width: min(560px, calc(100% - 32px)); background: var(--label-bg); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: 13px; text-align: center; pointer-events: none; }
+.pe-zoom { position: absolute; top: 12px; right: 12px; display: flex; gap: 4px; }
+.pe-zoom .btn { background: var(--label-bg); padding: 5px 10px; }
+.pe-tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.pe-tools .btn { padding: 7px 4px; font-size: 13px; }
+.pe-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.pe-part { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.pe-part.on { border-color: var(--accent); background: var(--accent-soft); }
+.pe-part > b { font-size: 12px; font-weight: 600; }
+.pe-checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 13px; }
+.pe-checks li.err { color: var(--warn); font-weight: 500; }
+.pe-checks li.warn { color: var(--muted); }
+.pe-checks li.warn::before { content: "! "; color: var(--warn); font-weight: 600; }
+.pe-foot { position: sticky; bottom: 0; background: var(--panel); margin-top: auto; padding: 12px 20px; border-top: 1px solid var(--line); display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .pe { grid-template-columns: minmax(0, 1fr); grid-template-rows: 48vh minmax(0, 1fr); }
+  .pe-stage { grid-row: 1; }
+  .pe-side { grid-row: 2; border-right: 0; border-top: 1px solid var(--line); }
+}
 </style>
 </head>
 <body>
@@ -380,6 +406,21 @@ label.btn { display: inline-flex; align-items: center; }
     </div>
 
     <div class="pane" id="pane-flat" role="tabpanel" aria-labelledby="tab-flat" hidden>
+      <section class="sec" aria-labelledby="h-plan">
+        <h2 id="h-plan">Планировка</h2>
+        <div class="btnrow">
+          <button type="button" class="btn primary" id="bPlanNew">Загрузить свою</button>
+          <button type="button" class="btn" id="bPlanEdit">Изменить текущую</button>
+        </div>
+        <div class="btnrow">
+          <label class="btn" for="planFile">Открыть файл плана…</label>
+          <input type="file" id="planFile" accept=".json,application/json" hidden>
+          <button type="button" class="btn" id="bPlanExport">Скачать план</button>
+        </div>
+        <p class="status" id="planStatus" role="status" aria-live="polite"></p>
+        <ul class="vlist" id="planListEl"></ul>
+        <small class="note">Загрузите фото или PDF плана, обведите комнаты и впишите свои замеры. Для каждой планировки расстановка мебели хранится отдельно.</small>
+      </section>
       <section class="sec">
         <div class="slider">
           <label for="ceil">Высота потолка</label>
@@ -493,13 +534,104 @@ label.btn { display: inline-flex; align-items: center; }
 THREE.ColorManagement.legacyMode = false;
 
 /* ------------------------------------------------------------------
+   Планировка: исходная квартира или загруженная пользователем (см. редактор в конце файла).
+   Прямоугольники: [x0, z0, x1, z1], метры. Проём лежит вдоль оси axis на линии line — грань стены со стороны комнаты.
+------------------------------------------------------------------- */
+const rawStore = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* storage blocked */ } },
+};
+const PLAN_LIST_KEY = 'flat3d.plans.v1', PLAN_ACTIVE_KEY = 'flat3d.plan.active.v1';
+const planList = () => { const l = rawStore.get(PLAN_LIST_KEY); return Array.isArray(l) ? l : []; };
+const OPENING_TYPES = ['window', 'door', 'balcony', 'entrance'], FLOOR_KINDS = ['wood', 'tile', 'deck'];
+function sanitizePlan(p) {
+  if (!p || typeof p !== 'object' || p.format !== 'flat3d-plan') throw new Error('Это не файл планировки.');
+  if (!Array.isArray(p.rooms) || !p.rooms.length) throw new Error('В планировке нет помещений.');
+  if (p.rooms.length > 60) throw new Error('Слишком много помещений: больше 60.');
+  const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : d), mm = (v) => Math.round(v * 1000) / 1000;
+  const clean = (t, d) => String(t == null ? d : t).replace(/[<>&"'`]/g, '').trim().slice(0, 60) || d;
+  const ids = new Set();
+  const rooms = p.rooms.map((r, n) => {
+    if (!r || !Array.isArray(r.rects) || !r.rects.length) throw new Error(`У помещения №${n + 1} нет размеров.`);
+    let id = String(r.id || '').replace(/[^\w-]/g, '').slice(0, 24) || 'r' + (n + 1);
+    while (ids.has(id)) id += '_';
+    ids.add(id);
+    const rects = r.rects.slice(0, 24).map((q) => {
+      if (!Array.isArray(q) || q.length < 4 || q.some((v, i) => i < 4 && typeof v !== 'number')) throw new Error(`Неверные размеры у помещения №${n + 1}.`);
+      const out = [mm(Math.min(q[0], q[2])), mm(Math.min(q[1], q[3])), mm(Math.max(q[0], q[2])), mm(Math.max(q[1], q[3]))];
+      if (out[2] - out[0] < 0.05 || out[3] - out[1] < 0.05) throw new Error(`Слишком маленькая часть у помещения №${n + 1}.`);
+      return out;
+    });
+    const o = { id, name: clean(r.name, 'Помещение ' + (n + 1)), floor: FLOOR_KINDS.includes(r.floor) ? r.floor : 'wood', rects };
+    if (num(r.area, 0) > 0) o.area = r.area;
+    if (num(r.perimeter, 0) > 0) o.perimeter = r.perimeter;
+    return o;
+  });
+  const xs = rooms.flatMap((r) => r.rects.flatMap((q) => [q[0], q[2]])), zs = rooms.flatMap((r) => r.rects.flatMap((q) => [q[1], q[3]]));
+  if (Math.max(...xs) - Math.min(...xs) > 60 || Math.max(...zs) - Math.min(...zs) > 60) throw new Error('План больше 60 м: проверьте единицы, размеры задаются в метрах.');
+  const openings = (Array.isArray(p.openings) ? p.openings : []).slice(0, 120).filter((o) => o && OPENING_TYPES.includes(o.type) && (o.axis === 'x' || o.axis === 'z')
+    && [o.line, o.from, o.to].every((v) => typeof v === 'number' && isFinite(v)) && Math.abs(o.to - o.from) >= 0.2).map((o) => {
+    const c = { type: o.type, axis: o.axis, line: mm(o.line), from: mm(Math.min(o.from, o.to)), to: mm(Math.max(o.from, o.to)),
+                side: o.side === -1 ? -1 : 1, hinge: o.hinge ? 1 : 0 };
+    if (typeof o.room === 'string' && ids.has(o.room)) c.room = o.room;
+    if (o.type === 'window') c.sill = Math.max(0, Math.min(2.5, num(o.sill, 0.8)));
+    if (num(o.top, 0) > 0) c.top = Math.max(0.5, Math.min(3.3, o.top));
+    return c;
+  });
+  const out = { format: 'flat3d-plan', version: 1, id: String(p.id || '').replace(/[^\w-]/g, '').slice(0, 24) || undefined, name: clean(p.name, 'Моя планировка'),
+    ceiling: Math.max(2.4, Math.min(3.3, num(p.ceiling, 2.7))), wall: Math.max(0.05, Math.min(0.6, num(p.wall, 0.2))), rooms, openings };
+  return out;
+}
+// Площадь и периметр объединения прямоугольников (растр 1 см).
+function rectStats(rects) {
+  const x0 = Math.min(...rects.map((r) => r[0])), z0 = Math.min(...rects.map((r) => r[1]));
+  const W = Math.round((Math.max(...rects.map((r) => r[2])) - x0) * 100) + 2, H = Math.round((Math.max(...rects.map((r) => r[3])) - z0) * 100) + 2;
+  const g = new Uint8Array(W * H);
+  rects.forEach((r) => {
+    const i0 = Math.round((r[0] - x0) * 100) + 1, i1 = Math.round((r[2] - x0) * 100) + 1, k0 = Math.round((r[1] - z0) * 100) + 1, k1 = Math.round((r[3] - z0) * 100) + 1;
+    for (let k = k0; k < k1; k++) g.fill(1, k * W + i0, k * W + i1);
+  });
+  let cells = 0, edges = 0;
+  for (let k = 1; k < H - 1; k++) for (let i = 1; i < W - 1; i++) {
+    if (!g[k * W + i]) continue;
+    cells++; edges += !g[k * W + i - 1] + !g[k * W + i + 1] + !g[(k - 1) * W + i] + !g[(k + 1) * W + i];
+  }
+  return { area: cells / 1e4, per: edges / 100 };
+}
+const PLAN = (() => {
+  const id = rawStore.get(PLAN_ACTIVE_KEY); if (!id) return null;
+  const p = planList().find((x) => x && x.id === id);
+  try { return p ? sanitizePlan(p) : null; } catch (e) { return null; }
+})();
+function planRooms(P) {
+  const mt = (v) => v.toFixed(3).replace('.', ',');
+  return P.rooms.map((r) => {
+    const st = rectStats(r.rects), big = r.rects.slice().sort((a, b) => (b[2] - b[0]) * (b[3] - b[1]) - (a[2] - a[0]) * (a[3] - a[1]))[0];
+    return { id: r.id, name: r.name, floor: r.floor, area: r.area || st.area, per: r.perimeter || st.per, rects: r.rects,
+      at: [(big[0] + big[2]) / 2, (big[1] + big[3]) / 2],
+      dims: r.rects.flatMap((q) => {
+        const inX = Math.min(0.3, (q[2] - q[0]) / 3), inZ = Math.min(0.3, (q[3] - q[1]) / 3);
+        return [[[q[0], q[1] + inZ], [q[2], q[1] + inZ], mt(q[2] - q[0])], [[q[2] - inX, q[1]], [q[2] - inX, q[3]], mt(q[3] - q[1])]];
+      }) };
+  });
+}
+const BOUNDS = PLAN ? (() => {
+  const all = PLAN.rooms.flatMap((r) => r.rects);
+  return { x0: Math.min(...all.map((r) => r[0])) - PLAN.wall, z0: Math.min(...all.map((r) => r[1])) - PLAN.wall,
+           x1: Math.max(...all.map((r) => r[2])) + PLAN.wall, z1: Math.max(...all.map((r) => r[3])) + PLAN.wall };
+})() : { x0: -0.36, z0: -0.10, x1: 7.53, z1: 11.92 };
+const SPAN_X = BOUNDS.x1 - BOUNDS.x0, SPAN_Z = BOUNDS.z1 - BOUNDS.z0;
+const KV = PLAN ? Math.max(0.85, Math.min(4, Math.max(SPAN_X, SPAN_Z) / 10)) : 1; // масштаб камеры и теней
+
+/* ------------------------------------------------------------------
    Данные. Метры. X — вправо (восток по плану), Z — вниз (юг по плану).
    X = 0 — внутренняя грань наружной стены К1/К2; Z = 0 — остекление кухни.
    Размеры помещений — из заключения по замерам, привязка — по плану застройщика.
 ------------------------------------------------------------------- */
-const FOOT = [[-0.36, -0.10, 7.53, 5.70], [-0.36, 5.70, 6.66, 11.92]];
+let FOOT = [[-0.36, -0.10, 7.53, 5.70], [-0.36, 5.70, 6.66, 11.92]];
 
-const ROOMS = [
+const DEFAULT_ROOMS = [
   { id: 'kitchen', name: 'Кухня', area: 19.638, per: 20.571, floor: 'wood', at: [1.75, 2.45],
     rects: [[-0.170, 0.004, 1.393, 1.522], [0.095, 0.273, 3.803, 3.506], [0.095, 3.506, 3.328, 4.088], [3.643, 3.506, 3.803, 3.748],
             [0, 4.088, 3.328, 4.177], [0, 4.177, 3.857, 4.380], [0, 4.380, 3.944, 5.385]],
@@ -532,7 +664,7 @@ const ROOMS = [
 ];
 
 // Проёмы. r — прямоугольник в плане (с запасом на толщину стены). sill — низ проёма.
-const OPENINGS = [
+const DEFAULT_OPENINGS = [
   { k: 'win', r: [-0.40, -0.14, 1.393, 0.004], sill: 0 },      // кухня: панорамное остекление
   { k: 'win', r: [-0.40, -0.14, -0.170, 1.522], sill: 0 },    // кухня: угол
   { k: 'win', r: [-0.40, 4.13, 0.00, 4.82], sill: 0 },        // кухня: у стены К2
@@ -550,6 +682,9 @@ const OPENINGS = [
   { k: 'door', r: [5.13, 7.58, 5.34, 8.30], hinge: 0, side: -1, open: 80 },  // гардероб
   { k: 'door', r: [6.37, 9.05, 6.70, 9.95], hinge: 0, side: 1, open: 85, entrance: true }, // входная
 ];
+
+const ROOMS = PLAN ? planRooms(PLAN) : DEFAULT_ROOMS;
+let OPENINGS = DEFAULT_OPENINGS;
 
 const PRESETS = [
   { group: 'Спальня', name: 'Кровать 160×200', kind: 'bed', w: 1.6, d: 2.05, h: 0.5, color: '#9C8B79' },
@@ -599,11 +734,10 @@ const PRESETS = [
 const $ = (s) => document.querySelector(s);
 const fmt = (n, d = 2) => n.toFixed(d).replace('.', ',');
 const cm = (m) => Math.round(m * 100);
-const CX = 3.58, CZ = 5.75;
-const store = {
-  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage blocked */ } },
-};
+const CX = PLAN ? (BOUNDS.x0 + BOUNDS.x1) / 2 : 3.58, CZ = PLAN ? (BOUNDS.z0 + BOUNDS.z1) / 2 : 5.75;
+// Обстановка хранится отдельно для каждой планировки; у исходной квартиры ключи прежние.
+const planKey = (k) => (PLAN ? k.replace('flat3d.', `flat3d.p.${PLAN.id}.`) : k);
+const store = { get: (k) => rawStore.get(planKey(k)), set: (k, v) => rawStore.set(planKey(k), v) };
 const state = {
   H: 2.70, mode: 'orbit', cut: false, labels: true, dims: false,
   ruler: false, rulerA: null, rulerB: null, rulerHover: null,
@@ -611,24 +745,60 @@ const state = {
 };
 const savedUI = store.get('flat3d.ui.v1');
 if (savedUI && typeof savedUI.H === 'number') state.H = Math.min(3.3, Math.max(2.4, savedUI.H));
+else if (PLAN) state.H = PLAN.ceiling;
 state.tod = savedUI && ['day', 'evening', 'night'].includes(savedUI.tod) ? savedUI.tod : 'day';
 function saveUI() { store.set('flat3d.ui.v1', { H: state.H, tod: state.tod, quality: state.quality }); }
 const savedF = store.get('flat3d.furniture.v1');
 if (Array.isArray(savedF)) state.furniture = savedF.filter((f) => f && typeof f.x === 'number');
 
 /* ------------------------------------------------------------------ raster of the plan (1 см) */
-const RES = 0.01, OX = -0.40, OZ = -0.15;
-const NX = Math.ceil((7.56 - OX) / RES), NZ = Math.ceil((11.95 - OZ) / RES);
+const RES = 0.01, OX = BOUNDS.x0 - 0.04, OZ = BOUNDS.z0 - 0.05;
+const NX = Math.ceil((BOUNDS.x1 + 0.03 - OX) / RES), NZ = Math.ceil((BOUNDS.z1 + 0.03 - OZ) / RES);
 const ci = (x) => Math.round((x - OX) / RES), ck = (z) => Math.round((z - OZ) / RES);
 function fillRect(arr, r, v) {
   const i0 = Math.max(0, ci(r[0])), i1 = Math.min(NX, ci(r[2]));
   const k0 = Math.max(0, ck(r[1])), k1 = Math.min(NZ, ck(r[3]));
   for (let k = k0; k < k1; k++) { const row = k * NX; for (let i = i0; i < i1; i++) arr[row + i] = v; }
 }
-const foot = new Uint8Array(NX * NZ); FOOT.forEach((r) => fillRect(foot, r, 1));
+const foot = new Uint8Array(NX * NZ);
+if (PLAN) {
+  // Контур дома: комнаты плюс толщина наружной стены; замкнутые пустоты (шахты) считаем стеной.
+  const W = PLAN.wall;
+  ROOMS.forEach((rm) => rm.rects.forEach((r) => fillRect(foot, [r[0] - W, r[1] - W, r[2] + W, r[3] + W], 1)));
+  const out = new Uint8Array(NX * NZ), stack = [0]; out[0] = 1;
+  while (stack.length) {
+    const c = stack.pop(), i = c % NX;
+    for (const n of [i > 0 ? c - 1 : -1, i < NX - 1 ? c + 1 : -1, c - NX, c + NX]) if (n >= 0 && n < out.length && !out[n] && !foot[n]) { out[n] = 1; stack.push(n); }
+  }
+  for (let i = 0; i < foot.length; i++) if (!out[i]) foot[i] = 1;
+  FOOT = mergeRects(foot);
+} else FOOT.forEach((r) => fillRect(foot, r, 1));
 const roomId = new Uint8Array(NX * NZ); ROOMS.forEach((rm, n) => rm.rects.forEach((r) => fillRect(roomId, r, n + 1)));
 const mass = new Uint8Array(NX * NZ);
 for (let i = 0; i < mass.length; i++) mass[i] = foot[i] && !roomId[i] ? 1 : 0;
+// Проёмы загруженной планировки: вдоль стены — from..to, поперёк — вся толщина стены от линии line.
+function resolveOpenings(list) {
+  return list.map((o) => {
+    const s = (o.from + o.to) / 2, ax = o.axis, cell = (q) => (ax === 'x' ? cellAt(s, q) : cellAt(q, s));
+    const solid = (q) => { const c = cell(q); return c >= 0 && mass[c] === 1; };
+    let q0 = null;
+    for (let d = 0; d <= 0.08 && q0 === null; d += 0.005) { if (solid(o.line + d)) q0 = o.line + d; else if (solid(o.line - d)) q0 = o.line - d; }
+    if (q0 === null) return null;
+    let lo = q0, hi = q0;
+    while (solid(lo - RES) && q0 - lo < 1.5) lo -= RES;
+    while (solid(hi + RES) && hi - q0 < 1.5) hi += RES;
+    const outside = (q) => { const c = cell(q); return c < 0 || !roomId[c]; };
+    const q1 = lo - (outside(lo - 2 * RES) ? 0.06 : 0.02), q2 = hi + (outside(hi + 2 * RES) ? 0.06 : 0.02), ext = outside(lo - 2 * RES) || outside(hi + 2 * RES);
+    const r = ax === 'x' ? [o.from, q1, o.to, q2] : [q1, o.from, q2, o.to];
+    r.ax = ax; // в толстой стене узкий проём нельзя определить по соотношению сторон
+    if (o.type === 'window') { const w = { k: 'win', r, sill: o.sill === undefined ? 0.8 : o.sill }; if (o.top) w.top = o.top; return w; }
+    const d = { k: 'door', r, hinge: o.hinge, side: o.side, open: 80 };
+    if (o.top) d.top = o.top;
+    if (o.type === 'balcony') { d.glass = true; d.top = o.top || 2.2; } else if (o.type === 'entrance' || ext) d.entrance = true;
+    return d;
+  }).filter(Boolean);
+}
+if (PLAN) OPENINGS = resolveOpenings(PLAN.openings);
 // Двери: открыта/закрыта (сохраняется), theta — текущий угол для анимации.
 const savedDoors = store.get('flat3d.doors.v1');
 const doorState = OPENINGS.map((o, n) => {
@@ -695,7 +865,7 @@ view.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
 const persp = new THREE.PerspectiveCamera(40, 1, 0.05, 700);
-persp.position.set(CX + 6.5, 14.5, CZ + 10.5);
+persp.position.set(CX + 6.5 * KV, 14.5 * KV, CZ + 10.5 * KV);
 const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 200);
 ortho.position.set(CX, 40, CZ + 0.001);
 
@@ -708,7 +878,7 @@ window.addEventListener('pointerup', onUp);
 const orbit = new THREE.OrbitControls(persp, canvas);
 orbit.target.set(CX, 0, CZ);
 orbit.enableDamping = true; orbit.dampingFactor = 0.09;
-orbit.maxPolarAngle = Math.PI * 0.49; orbit.minDistance = 2; orbit.maxDistance = 45;
+orbit.maxPolarAngle = Math.PI * 0.49; orbit.minDistance = 2; orbit.maxDistance = 45 * KV;
 orbit.update();
 const planCtl = new THREE.OrbitControls(ortho, canvas);
 planCtl.target.set(CX, 0, CZ);
@@ -723,11 +893,11 @@ planCtl.update();
 const hemi = new THREE.HemisphereLight(0xffffff, 0xc4beb4, 0.8);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 0.5);
-sun.position.set(CX - 4, 18, CZ - 3);
+sun.position.set(CX - 4 * KV, 18 * KV, CZ - 3 * KV);
 sun.target.position.set(CX, 0, CZ);
 sun.castShadow = true;
 sun.shadow.mapSize.set(4096, 4096);
-Object.assign(sun.shadow.camera, { left: -10, right: 10, top: 10, bottom: -10, near: 1, far: 45 });
+Object.assign(sun.shadow.camera, { left: -10 * KV, right: 10 * KV, top: 10 * KV, bottom: -10 * KV, near: 1, far: 45 * KV });
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
 scene.add(sun, sun.target);
 const amb = new THREE.AmbientLight(0xffffff, 0.2);
@@ -986,11 +1156,11 @@ function toGeometry(G, uvSize) {
   }
   return geo;
 }
-const along = (r) => (r[2] - r[0]) >= (r[3] - r[1]) ? 'x' : 'z';
-const clipFoot = (r) => [Math.max(r[0], -0.36), Math.max(r[1], -0.10), Math.min(r[2], 7.53), Math.min(r[3], 11.92)];
+const along = (r) => r.ax || ((r[2] - r[0]) >= (r[3] - r[1]) ? 'x' : 'z');
+const clipFoot = (r) => [Math.max(r[0], BOUNDS.x0), Math.max(r[1], BOUNDS.z0), Math.min(r[2], BOUNDS.x1), Math.min(r[3], BOUNDS.z1)];
 function openingSpan(o) {
   if (o.k === 'door') return [0, Math.min(o.top || 2.1, state.H - 0.08)];
-  return [o.sill, Math.max(o.sill + 0.3, state.H - 0.30)];
+  return [o.sill, Math.max(o.sill + 0.3, o.top ? Math.min(o.top, state.H - 0.05) : state.H - 0.30)];
 }
 function wallTop() { return state.cut && state.mode !== 'walk' ? Math.min(1.2, state.H) : state.H; }
 
@@ -1051,8 +1221,10 @@ const slab = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMa
 {
   const G = { p: [], n: [], c: [] }, white = new THREE.Color(1, 1, 1);
   FOOT.forEach((r) => pushBox(G, r[0] - 0.02, -0.22, r[1] - 0.02, r[2] + 0.02, -0.001, r[3] + 0.02, white, white));
-  pushBox(G, -0.72, -0.22, -0.42, -0.36, -0.001, 5.15, white, white);       // выступ с ограждением у кухни
-  pushBox(G, -0.36, -0.22, -0.42, 1.70, -0.001, -0.10, white, white);
+  if (!PLAN) {
+    pushBox(G, -0.72, -0.22, -0.42, -0.36, -0.001, 5.15, white, white);     // выступ с ограждением у кухни
+    pushBox(G, -0.36, -0.22, -0.42, 1.70, -0.001, -0.10, white, white);
+  }
   slab.geometry = toGeometry(G); slab.receiveShadow = true; scene.add(slab);
 }
 // Затенение пола у стен и в углах: расстояние до ближайшей стены по растру плана (шаг 2 см).
@@ -1139,7 +1311,7 @@ function addRail(x0, z0, x1, z1) {
   g.position.set((x0 + x1) / 2, 0, (z0 + z1) / 2); g.rotation.y = -Math.atan2(z1 - z0, x1 - x0);
   scene.add(g);
 }
-addRail(-0.69, -0.40, -0.69, 5.13); addRail(-0.69, -0.40, 1.68, -0.40);
+if (!PLAN) { addRail(-0.69, -0.40, -0.69, 5.13); addRail(-0.69, -0.40, 1.68, -0.40); }
 
 // стены
 const wallMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92 });
@@ -1199,8 +1371,8 @@ function buildWalls() {
     };
     if (o.k === 'win') {
       if (!showTall && y0 >= wallTop()) return;
-      const len = Math.max(0.05, Math.min(b, ax === 'x' ? 7.53 : 11.92) - Math.max(a, ax === 'x' ? -0.36 : -0.10));
-      const s0 = Math.max(a, ax === 'x' ? -0.36 : -0.10);
+      const len = Math.max(0.05, Math.min(b, ax === 'x' ? BOUNDS.x1 : BOUNDS.z1) - Math.max(a, ax === 'x' ? BOUNDS.x0 : BOUNDS.z0));
+      const s0 = Math.max(a, ax === 'x' ? BOUNDS.x0 : BOUNDS.z0);
       const hh = (showTall ? y1 : Math.min(y1, wallTop())) - y0;
       if (hh <= 0.02) return;
       place(new THREE.Mesh(new THREE.BoxGeometry(len, hh, 0.02), glassMat), s0 + len / 2, mid, hh, y0);
@@ -2122,7 +2294,7 @@ function addItem(p) {
   if (state.room >= 0) cands.push(ROOMS[state.room].at);
   const hit = floorHit(0, 0);
   if (hit && isFloor(hit.x, hit.z)) cands.push([hit.x, hit.z], ROOMS[roomAt(hit.x, hit.z)].at);
-  cands.push(ROOMS[1].at, ROOMS[0].at);
+  cands.push((ROOMS[1] || ROOMS[0]).at, ROOMS[0].at);
   const [x, z] = cands.find(fits) || cands[0];
   const it = { id: 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name: p.name, kind: p.kind,
                w: p.w, d: p.d, h: p.h, color: p.color, x: Math.round(x * 100) / 100, z: Math.round(z * 100) / 100, rot: 0 };
@@ -2539,7 +2711,7 @@ function windowFrame(n) {
   const mid = ax === 'x' ? (cr[1] + cr[3]) / 2 : (cr[0] + cr[2]) / 2;
   const at = (s, q) => (ax === 'x' ? roomAt(s, q) : roomAt(q, s));
   const scan = (dir) => { for (let d = 0; d < 1; d += 0.01) { const r = at(c, mid + dir * d); if (r >= 0) return { side: dir, face: mid + dir * d, r }; } return null; };
-  const P = scan(1), M = scan(-1), ok = (x) => x && ROOMS[x.r].id !== 'balcony';
+  const P = scan(1), M = scan(-1), ok = (x) => x && ROOMS[x.r].floor !== 'deck';
   const pick = ok(P) ? P : ok(M) ? M : (P || M);
   if (!pick) return null;
   const line = pick.face + pick.side * 0.12;
@@ -2936,7 +3108,8 @@ function stepCamera(dt) {
 }
 
 /* ------------------------------------------------------------------ walk mode */
-const walk = { yaw: 0.95, pitch: -0.05, keys: new Set(), look: null, target: null, pos: new THREE.Vector3(5.9, 1.6, 9.3), saved: null };
+const WALK0 = PLAN ? ROOMS.slice().sort((a, b) => b.area - a.area)[0].at : [5.9, 9.3];
+const walk = { yaw: 0.95, pitch: -0.05, keys: new Set(), look: null, target: null, pos: new THREE.Vector3(WALK0[0], 1.6, WALK0[1]), saved: null };
 function walkable(x, z) {
   const c = cellAt(x, z); if (c < 0) return false;
   const v = walkGrid[c];
@@ -2996,7 +3169,7 @@ function setMode(m) {
   if (m === 'walk') {
     walk.saved = { pos: persp.position.clone(), target: orbit.target.clone() };
     walk.target = null;
-    if (!canStand(walk.pos.x, walk.pos.z)) walk.pos.set(5.9, 1.6, 9.3);
+    if (!canStand(walk.pos.x, walk.pos.z)) walk.pos.set(WALK0[0], 1.6, WALK0[1]);
     if (state.ruler) toggleRuler(false);
   }
   state.mode = m;
@@ -3112,8 +3285,8 @@ $('#bRuler').addEventListener('click', () => toggleRuler(!state.ruler));
 $('#bRulerClear').addEventListener('click', () => { state.rulerA = state.rulerB = state.rulerHover = null; drawRuler(); });
 
 $('#bReset').addEventListener('click', () => {
-  if (state.mode === 'walk') { walk.pos.set(5.9, 1.6, 9.3); walk.yaw = 0.95; walk.pitch = -0.05; walk.target = null; return; }
-  persp.position.set(CX + 6.5, 14.5, CZ + 10.5); orbit.target.set(CX, 0, CZ); orbit.update();
+  if (state.mode === 'walk') { walk.pos.set(WALK0[0], 1.6, WALK0[1]); walk.yaw = 0.95; walk.pitch = -0.05; walk.target = null; return; }
+  persp.position.set(CX + 6.5 * KV, 14.5 * KV, CZ + 10.5 * KV); orbit.target.set(CX, 0, CZ); orbit.update();
   ortho.position.set(CX, 40, CZ + 0.001); ortho.zoom = 1; ortho.updateProjectionMatrix(); planCtl.target.set(CX, 0, CZ); planCtl.update();
 });
 
@@ -3445,7 +3618,7 @@ $('#varForm').addEventListener('submit', (e) => {
 $('#bExport').addEventListener('click', async () => {
   if (!V.downloads) return;
   const cur = V.list.find((v) => v.id === V.current), name = cur ? strOr(cur.name, 'вариант') : 'вариант';
-  const fname = `Трёшка 72,7 — ${name}`.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 120) + '.json';
+  const fname = `${PLAN ? PLAN.name : 'Трёшка 72,7'} — ${name}`.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 120) + '.json';
   try { await V.downloads.save({ filename: fname, data: JSON.stringify({ format: 'flat3d', version: 1, ...snapshotState(name) }, null, 2) }); status('Файл сохранён.'); }
   catch (e) { if (e && e.code !== 'declined') status('Не получилось скачать файл в этом окне.', true); }
 });
@@ -3467,7 +3640,7 @@ $('#importFile').addEventListener('change', (e) => {
 async function initVariants() {
   V.list = localList().sort((a, b) => String(b.savedAt).localeCompare(String(a.savedAt))); renderVariants();
   const C = window.claude;
-  if (!C || typeof C.use !== 'function') {
+  if (PLAN || !C || typeof C.use !== 'function') {
     // вне claude.ai: файл скачивается обычной ссылкой браузера
     V.downloads = { save: async ({ filename, data }) => {
       const a = document.createElement('a'), url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
@@ -3508,7 +3681,7 @@ function resize() {
   const w = Math.max(1, stage.clientWidth), h = Math.max(1, stage.clientHeight), a = w / h;
   renderer.setSize(w, h); labelRenderer.setSize(w, h); sizeComposer();
   persp.aspect = a; persp.updateProjectionMatrix();
-  const vh = Math.max(14, 9.6 / a);
+  const vh = Math.max(SPAN_Z * 1.17, SPAN_X * 1.22 / a);
   Object.assign(ortho, { left: -vh * a / 2, right: vh * a / 2, top: vh / 2, bottom: -vh / 2 }); ortho.updateProjectionMatrix();
   persp.fov = state.mode === 'walk' ? (a < 0.8 ? 80 : 68) : (a < 0.8 ? 55 : 40); persp.updateProjectionMatrix();
 }
@@ -3530,7 +3703,9 @@ updateHint();
 drawRuler();
 
 let last = performance.now();
+const PE = { open: false }; // открыт редактор планировки: 3D за ним не рисуем
 function loop(now) {
+  if (PE.open) { last = now; requestAnimationFrame(loop); return; }
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   doorLeaves.forEach((leaf) => {
     const n = leaf.userData.door, s = doorState[n], target = s.open ? doorOpenAngle(n) : 0;
@@ -3547,6 +3722,718 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
+
+/* ------------------------------------------------------------------ редактор планировки */
+{
+const FLOOR_NAMES = { wood: 'Ламинат', tile: 'Плитка', deck: 'Балкон' };
+const OP_NAMES = { window: 'Окно', door: 'Дверь', balcony: 'Балконная дверь', entrance: 'Входная дверь' };
+const OP_WIDTH = { window: 1.5, door: 0.8, balcony: 0.75, entrance: 0.9 };
+const TOOL_HINT = {
+  select: 'Нажмите на комнату, чтобы выбрать и двигать. Края тянутся, размеры вписываются слева. Колесо — масштаб, перетаскивание пустого места — сдвиг плана.',
+  room: 'Растяните прямоугольник по внутренним стенам комнаты. Края прилипают к соседним комнатам с зазором на перегородку.',
+  part: 'Растяните прямоугольник, примыкающий к выбранной комнате: так получится Г-образная комната, ниша или выступ.',
+  window: 'Нажмите на стену комнаты там, где находится окно.',
+  door: 'Нажмите на стену комнаты там, где находится дверь.',
+  balcony: 'Нажмите на стену комнаты там, где находится балконная дверь.',
+  entrance: 'Нажмите на стену коридора там, где находится входная дверь.',
+  scale: 'Отметьте две точки на плане, расстояние между которыми знаете, например длину стены по размеру на плане.',
+  image: 'Перетащите подложку, чтобы совместить её с нарисованными комнатами.',
+};
+const newPlanId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+const DRAFT_KEY = 'flat3d.plan.draft.v1', imgKey = (id) => `flat3d.planimg.${id}`;
+const LAYOUT_KEYS = ['furniture.v1', 'wall.v1', 'lights.v1', 'curtains.v1', 'doors.v1'];
+const mmOf = (m) => Math.round(m * 1000);
+
+// Текущая планировка в формате файла.
+function currentPlan() {
+  if (PLAN) return JSON.parse(JSON.stringify(PLAN));
+  const rooms = ROOMS.map((r) => ({ id: r.id, name: r.name, floor: r.floor, area: r.area, perimeter: r.per, rects: r.rects.map((q) => q.slice()) }));
+  const openings = OPENINGS.map((o) => {
+    const ax = along(o.r), cr = clipFoot(o.r), from = ax === 'x' ? o.r[0] : o.r[1], to = ax === 'x' ? o.r[2] : o.r[3];
+    const mid = ax === 'x' ? (cr[1] + cr[3]) / 2 : (cr[0] + cr[2]) / 2, s = (Math.max(from, ax === 'x' ? cr[0] : cr[1]) + to) / 2;
+    let best = null;
+    rooms.forEach((rm) => rm.rects.forEach((q) => {
+      const [lo, hi, e0, e1] = ax === 'x' ? [q[0], q[2], q[1], q[3]] : [q[1], q[3], q[0], q[2]];
+      if (s < lo - 0.01 || s > hi + 0.01) return;
+      [[e0, 1], [e1, -1]].forEach(([e, into]) => { const d = Math.abs(e - mid); if (!best || d < best.d) best = { d, e, into, room: rm.id }; });
+    }));
+    const type = o.k === 'win' ? 'window' : o.glass ? 'balcony' : o.entrance ? 'entrance' : 'door';
+    const c = { type, axis: ax, line: best ? best.e : mid, from, to, side: o.side || (best ? best.into : 1), hinge: o.hinge || 0, room: best ? best.room : undefined };
+    if (o.k === 'win') c.sill = o.sill;
+    if (o.top) c.top = o.top;
+    return c;
+  });
+  return { format: 'flat3d-plan', version: 1, name: 'Моя квартира', ceiling: state.H, wall: 0.2, rooms, openings };
+}
+const planForFile = (p) => { const o = JSON.parse(JSON.stringify(p)); delete o.id; return o; };
+async function savePlanFile(p) {
+  const name = `${p.name} — планировка`.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 120) + '.json';
+  if (!V.downloads) throw new Error('no downloads');
+  await V.downloads.save({ filename: name, data: JSON.stringify(planForFile(p), null, 2) });
+}
+function activate(id) {
+  if (id) rawStore.set(PLAN_ACTIVE_KEY, id); else rawStore.del(PLAN_ACTIVE_KEY);
+  location.reload();
+}
+function storePlan(p) {
+  const l = planList(), i = l.findIndex((x) => x.id === p.id);
+  if (i >= 0) l[i] = p; else l.push(p);
+  return rawStore.set(PLAN_LIST_KEY, l);
+}
+
+/* панель «Квартира» */
+const planStatus = (t, err) => { const el = $('#planStatus'); el.textContent = t; el.classList.toggle('err', !!err); };
+function renderPlanList() {
+  const box = $('#planListEl'); box.innerHTML = '';
+  const row = (name, meta, cur, onOpen, onDel) => {
+    const li = document.createElement('li'); if (cur) li.className = 'current';
+    li.innerHTML = '<span class="vname"></span><span class="vmeta"></span><span class="vbtns"></span>';
+    li.querySelector('.vname').textContent = name; li.querySelector('.vmeta').textContent = meta;
+    const btns = li.querySelector('.vbtns');
+    if (!cur) { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = 'Открыть'; b.addEventListener('click', onOpen); btns.appendChild(b); }
+    if (onDel) { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn danger'; b.textContent = 'Удалить'; b.addEventListener('click', onDel); btns.appendChild(b); }
+    box.appendChild(li);
+  };
+  row('Исходная квартира', '72,685 м²', !PLAN, () => activate(null));
+  planList().forEach((p) => {
+    let area = 0; try { p.rooms.forEach((r) => { area += r.area || rectStats(r.rects).area; }); } catch (e) { return; }
+    let armed = false;
+    row(p.name, `${fmt(area, 2)} м² · помещений: ${p.rooms.length}`, !!PLAN && PLAN.id === p.id, () => activate(p.id), (e) => {
+      // удаление без отдельного окна: вторым нажатием
+      if (!armed) { armed = true; e.target.textContent = 'Точно удалить?'; return; }
+      rawStore.set(PLAN_LIST_KEY, planList().filter((x) => x.id !== p.id));
+      rawStore.del(imgKey(p.id));
+      Object.keys(localStorage).filter((k) => k.startsWith(`flat3d.p.${p.id}.`)).forEach((k) => rawStore.del(k));
+      if (PLAN && PLAN.id === p.id) activate(null); else renderPlanList();
+    });
+  });
+}
+renderPlanList();
+if (PLAN) {
+  const total = ROOMS.reduce((a, r) => a + r.area, 0), per = ROOMS.reduce((a, r) => a + r.per, 0);
+  document.title = PLAN.name;
+  $('.brand h1').textContent = PLAN.name;
+  $('.brand .eyebrow').textContent = `Помещений: ${ROOMS.length} · своя планировка`;
+  $('.brand .sub').firstChild.textContent = 'Общая ';
+  $('.brand .sub .num').textContent = fmt(total, 2);
+  const foot = document.querySelectorAll('.rooms tfoot td'); foot[1].textContent = fmt(total, 3); foot[2].textContent = fmt(per, 3);
+  document.querySelector('.stamp table').innerHTML = `<tr><td>Размеры помещений</td><td>своя планировка</td></tr><tr><td>Площадь</td><td class="num">${fmt(total, 3)} м²</td></tr><tr><td>Сумма периметров</td><td class="num">${fmt(per, 3)} м</td></tr>`;
+  document.querySelector('.stamp p').textContent = 'Высота окон и дверей задаётся в редакторе планировки, по умолчанию окна до 30 см от потолка, двери 210 см.';
+}
+if (PLAN && OPENINGS.length < PLAN.openings.length) planStatus(`Не на стене и не построено проёмов: ${PLAN.openings.length - OPENINGS.length}. Проверьте их в редакторе.`, true);
+$('#bPlanExport').addEventListener('click', async () => {
+  try { await savePlanFile(currentPlan()); planStatus('Файл плана сохранён.'); }
+  catch (e) { if (!e || e.code !== 'declined') planStatus('Не получилось скачать файл в этом окне.', true); }
+});
+$('#planFile').addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0]; if (!file) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    e.target.value = '';
+    try {
+      const p = sanitizePlan(JSON.parse(String(rd.result)));
+      p.id = newPlanId();
+      if (!storePlan(p)) throw new Error('Не хватило места в браузере.');
+      activate(p.id);
+    } catch (err) { planStatus(err instanceof SyntaxError ? 'Файл повреждён: это не JSON.' : err.message, true); }
+  };
+  rd.onerror = () => { planStatus('Не получилось прочитать файл.', true); e.target.value = ''; };
+  rd.readAsText(file);
+});
+$('#bPlanNew').addEventListener('click', () => {
+  const d = rawStore.get(DRAFT_KEY);
+  openEditor(d && d.fresh ? d : { format: 'flat3d-plan', version: 1, id: newPlanId(), fresh: true, name: 'Моя планировка', ceiling: 2.7, wall: 0.2, rooms: [], openings: [] });
+});
+$('#bPlanEdit').addEventListener('click', () => {
+  const p = currentPlan();
+  if (!p.id) { p.id = newPlanId(); p.fromDefault = true; }
+  openEditor(p);
+});
+
+/* редактор */
+let E = null, cv = null, g = null, root = null;
+function roomArea(rm) { return rectStats(rm.rects).area; }
+function buildDom() {
+  root = document.createElement('div'); root.className = 'pe'; root.setAttribute('role', 'dialog'); root.setAttribute('aria-modal', 'true'); root.setAttribute('aria-label', 'Редактор планировки');
+  root.innerHTML = `
+  <aside class="pe-side">
+    <section class="sec"><h2>Редактор планировки</h2>
+      <label class="field"><span>Название</span><input type="text" id="peName" maxlength="60"></label></section>
+    <section class="sec"><h3>1. План-подложка</h3>
+      <div class="btnrow"><label class="btn" for="peImg">Фото или PDF…</label><input type="file" id="peImg" accept="image/*,application/pdf,.pdf" hidden>
+        <button type="button" class="btn" data-tool="scale" id="peScaleBtn" disabled>Задать масштаб</button></div>
+      <div id="peImgBox" hidden class="pe-grid" style="display:grid">
+        <label class="field" style="grid-column:1/-1"><span>Прозрачность подложки</span><input type="range" id="peOpacity" min="0.1" max="1" step="0.05"></label>
+        <label class="field" id="pePageBox" hidden><span>Страница PDF</span><input type="number" id="pePage" min="1" step="1"></label>
+        <button type="button" class="btn" id="peRot">Повернуть 90°</button>
+        <button type="button" class="btn" data-tool="image">Двигать</button>
+        <button type="button" class="btn danger" id="peImgDel">Убрать</button>
+      </div>
+      <div id="peScaleBox" hidden class="pe-grid" style="align-items:end">
+        <label class="field"><span>Расстояние, мм</span><input type="number" id="peScaleLen" min="1" step="1"></label>
+        <button type="button" class="btn primary" id="peScaleOk">Применить</button>
+      </div>
+      <small class="note" id="peImgNote">Необязательно: можно сразу нарисовать комнаты и вписать размеры. Подложка хранится только в этом браузере.</small></section>
+    <section class="sec"><h3>2. Рисование</h3>
+      <div class="pe-tools">
+        <button type="button" class="btn" data-tool="select">Выбор</button>
+        <button type="button" class="btn" data-tool="room">Комната</button>
+        <button type="button" class="btn" data-tool="part" id="pePartBtn">Часть</button>
+        <button type="button" class="btn" data-tool="door">Дверь</button>
+        <button type="button" class="btn" data-tool="window">Окно</button>
+        <button type="button" class="btn" data-tool="entrance">Вход</button>
+        <button type="button" class="btn" data-tool="balcony" style="grid-column:1/-1">Балконная дверь</button>
+      </div></section>
+    <section class="sec"><h3>3. Замеры</h3><div id="peInsp" style="display:grid;gap:10px"></div></section>
+    <section class="sec"><h3>Помещения</h3><ul class="flist" id="peRooms"></ul><p class="empty" id="peTotal"></p></section>
+    <section class="sec"><h3>Общие размеры</h3>
+      <div class="pe-grid">
+        <label class="field"><span>Потолок, мм</span><input type="number" id="peCeil" min="2400" max="3300" step="10"></label>
+        <label class="field"><span>Наружная стена, мм</span><input type="number" id="peWall" min="50" max="600" step="10"></label>
+        <label class="field"><span>Перегородка при прилипании, мм</span><input type="number" id="peGap" min="0" max="600" step="10"></label>
+      </div></section>
+    <section class="sec"><h3>Проверка</h3><ul class="pe-checks" id="peChecks"></ul></section>
+    <div class="pe-foot">
+      <button type="button" class="btn primary" id="peBuild">Построить 3D</button>
+      <button type="button" class="btn" id="peUndo">Отменить</button>
+      <button type="button" class="btn" id="peExport">Скачать план</button>
+      <button type="button" class="btn" id="peClose">Закрыть</button>
+      <p class="status" id="peStatus" role="status" aria-live="polite" style="flex-basis:100%"></p>
+    </div>
+  </aside>
+  <div class="pe-stage"><canvas id="peCanvas" aria-label="Чертёж планировки"></canvas>
+    <div class="pe-zoom"><button type="button" class="btn" id="peZoomOut" aria-label="Уменьшить">−</button><button type="button" class="btn" id="peFit">По размеру</button><button type="button" class="btn" id="peZoomIn" aria-label="Увеличить">+</button></div>
+    <div class="pe-hint" id="peHint"></div></div>`;
+  document.body.appendChild(root);
+  cv = root.querySelector('#peCanvas'); g = cv.getContext('2d');
+  bindDom();
+}
+const q = (s) => root.querySelector(s);
+const status_ = (t, err) => { const el = q('#peStatus'); el.textContent = t; el.classList.toggle('err', !!err); };
+function openEditor(plan) {
+  if (!root) buildDom();
+  E = { plan, tool: plan.rooms.length ? 'select' : 'room', sel: null, s: 60, ox: 0, oy: 0, img: null, hist: [], drag: null, draft: null, scaleA: null, scaleB: null, gap: 0.1, pdf: null, pointer: null };
+  PE.open = true; root.hidden = false;
+  q('#peName').value = plan.name; q('#peCeil').value = mmOf(plan.ceiling); q('#peWall').value = mmOf(plan.wall); q('#peGap').value = mmOf(E.gap);
+  status_('');
+  const saved = rawStore.get(imgKey(plan.id));
+  if (saved && saved.src) { E.img = { ...saved, el: new Image() }; E.img.el.onload = () => { fit(); draw(); }; E.img.el.src = saved.src; }
+  resizeCv(); fit(); setTool(E.tool); renderImgBox(); renderInsp(); renderRooms(); renderChecks(); draw();
+}
+function closeEditor() { PE.open = false; root.hidden = true; }
+function setTool(t) {
+  if (t === 'part' && !(E.sel && E.sel.room !== undefined)) { status_('Сначала выберите комнату, к которой добавить часть.', true); return; }
+  E.tool = t; E.draft = null; if (t !== 'scale') { E.scaleA = E.scaleB = null; q('#peScaleBox').hidden = true; }
+  root.querySelectorAll('[data-tool]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.tool === t)));
+  q('#peHint').textContent = TOOL_HINT[t]; cv.style.cursor = t === 'select' ? 'default' : t === 'image' ? 'move' : 'crosshair';
+  status_(''); draw();
+}
+function touch() {
+  // черновик новой планировки: чтобы случайно закрытый редактор ничего не потерял
+  if (E.plan.fresh) rawStore.set(DRAFT_KEY, E.plan);
+  renderChecks(); draw();
+}
+function remember() { E.hist.push(JSON.stringify(E.plan)); if (E.hist.length > 80) E.hist.shift(); }
+function undo() {
+  if (!E.hist.length) return;
+  E.plan = JSON.parse(E.hist.pop()); E.sel = null;
+  q('#peName').value = E.plan.name; renderInsp(); renderRooms(); touch();
+}
+
+/* геометрия чертежа */
+function resizeCv() {
+  const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.round(r.width * d)); cv.height = Math.max(1, Math.round(r.height * d)); E.dpr = d; E.cw = r.width; E.ch = r.height;
+}
+function imgBounds() {
+  const m = E.img, w = m.el.naturalWidth * m.mpp, h = m.el.naturalHeight * m.mpp;
+  const c = [[0, 0], [w, 0], [0, h], [w, h]].map(([a, b]) => { const t = m.rot * Math.PI / 2, cs = Math.cos(t), sn = Math.sin(t); return [m.x + a * cs - b * sn, m.z + a * sn + b * cs]; });
+  return [Math.min(...c.map((p) => p[0])), Math.min(...c.map((p) => p[1])), Math.max(...c.map((p) => p[0])), Math.max(...c.map((p) => p[1]))];
+}
+function fit() {
+  const all = E.plan.rooms.flatMap((r) => r.rects);
+  if (E.img && E.img.el.naturalWidth) all.push(imgBounds());
+  const b = all.length ? [Math.min(...all.map((r) => r[0])), Math.min(...all.map((r) => r[1])), Math.max(...all.map((r) => r[2])), Math.max(...all.map((r) => r[3]))] : [0, 0, 10, 8];
+  E.s = Math.max(8, Math.min(400, Math.min((E.cw - 80) / Math.max(1, b[2] - b[0]), (E.ch - 120) / Math.max(1, b[3] - b[1]))));
+  E.ox = E.cw / 2 - E.s * (b[0] + b[2]) / 2; E.oy = E.ch / 2 - E.s * (b[1] + b[3]) / 2;
+}
+const sx = (x) => E.ox + x * E.s, sy = (z) => E.oy + z * E.s;
+function world(e) { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left - E.ox) / E.s, z: (e.clientY - r.top - E.oy) / E.s, px: e.clientX - r.left, py: e.clientY - r.top }; }
+const round1 = (v) => Math.round(v * 100) / 100;
+// Прилипание к краям комнат: вплотную или через перегородку; иначе шаг 1 см.
+function snap(v, axis, skip) {
+  const tol = 9 / E.s; let best = null, bd = tol;
+  E.plan.rooms.forEach((rm) => rm.rects.forEach((r) => {
+    if (r === skip) return;
+    const a = axis === 'x' ? r[0] : r[1], b = axis === 'x' ? r[2] : r[3];
+    [a, b, a - E.gap, b + E.gap].forEach((c) => { const d = Math.abs(v - c); if (d < bd) { bd = d; best = c; } });
+  }));
+  return best === null ? round1(v) : best;
+}
+function edgeHit(p, onlySel) {
+  const tol = 8 / E.s; let best = null, bd = tol;
+  const test = (rm, r) => [['x0', r[0], r[1], r[3], p.x, p.z], ['x1', r[2], r[1], r[3], p.x, p.z], ['z0', r[1], r[0], r[2], p.z, p.x], ['z1', r[3], r[0], r[2], p.z, p.x]].forEach(([e, c, lo, hi, u, w]) => {
+    if (w < lo - tol || w > hi + tol) return;
+    const d = Math.abs(u - c); if (d < bd) { bd = d; best = { rm, r, e }; }
+  });
+  const seen = E.sel && E.sel.room !== undefined ? E.plan.rooms[E.sel.room] : null;
+  if (seen) seen.rects.forEach((r) => test(seen, r));
+  if (best || onlySel) return best;
+  E.plan.rooms.forEach((rm) => rm.rects.forEach((r) => test(rm, r)));
+  return best;
+}
+function rectAt(p) {
+  for (let i = E.plan.rooms.length - 1; i >= 0; i--) { const rm = E.plan.rooms[i];
+    for (let j = 0; j < rm.rects.length; j++) { const r = rm.rects[j]; if (p.x >= r[0] && p.x <= r[2] && p.z >= r[1] && p.z <= r[3]) return { room: i, rect: j }; } }
+  return null;
+}
+function opAt(p) {
+  const tol = 9 / E.s; let best = -1, bd = tol;
+  E.plan.openings.forEach((o, i) => {
+    const [u, w] = o.axis === 'x' ? [p.x, p.z] : [p.z, p.x];
+    if (u < o.from - tol || u > o.to + tol) return;
+    const d = Math.abs(w - o.line); if (d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+function setEdge(rm, r, e, v) {
+  const i = { x0: 0, z0: 1, x1: 2, z1: 3 }[e], other = r[{ x0: 2, z0: 3, x1: 0, z1: 1 }[e]];
+  if (i < 2) v = Math.min(v, other - 0.1); else v = Math.max(v, other + 0.1);
+  const old = r[i], ax = i % 2 === 0 ? 'z' : 'x';
+  r[i] = Math.round(v * 1000) / 1000;
+  // проёмы на этой грани едут вместе с ней
+  E.plan.openings.forEach((o) => { if (o.room === rm.id && o.axis === ax && Math.abs(o.line - old) < 0.002) o.line = r[i]; });
+}
+function moveRoom(rm, dx, dz, base) {
+  rm.rects.forEach((r, i) => { const b = base.rects[i]; r[0] = b[0] + dx; r[1] = b[1] + dz; r[2] = b[2] + dx; r[3] = b[3] + dz; });
+  base.ops.forEach(([o, line, from, to]) => {
+    o.line = line + (o.axis === 'x' ? dz : dx); o.from = from + (o.axis === 'x' ? dx : dz); o.to = to + (o.axis === 'x' ? dx : dz);
+  });
+}
+function addOpening(type, p) {
+  const e = (() => { const h = edgeHit(p); return h; })() || (() => {
+    // допуск шире: нажать точно в линию на телефоне трудно
+    const keep = E.s; E.s = E.s / 2.5; const h = edgeHit(p); E.s = keep; return h; })();
+  if (!e) { status_('Нажмите ближе к стене комнаты.', true); return; }
+  remember();
+  const ax = e.e[0] === 'z' ? 'x' : 'z', r = e.r, lo = ax === 'x' ? r[0] : r[1], hi = ax === 'x' ? r[2] : r[3], s = ax === 'x' ? p.x : p.z;
+  const w = Math.min(OP_WIDTH[type], hi - lo), c = Math.max(lo + w / 2, Math.min(hi - w / 2, round1(s)));
+  const o = { type, axis: ax, line: r[{ x0: 0, z0: 1, x1: 2, z1: 3 }[e.e]], from: c - w / 2, to: c + w / 2, side: e.e.endsWith('0') ? 1 : -1, hinge: 0, room: e.rm.id };
+  if (type === 'window') { o.sill = 0.8; o.side = 1; }
+  E.plan.openings.push(o); E.sel = { op: E.plan.openings.length - 1 };
+  setTool('select'); renderInsp(); touch();
+}
+
+/* мышь */
+function bindCanvas() {
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
+  cv.addEventListener('pointerdown', (e) => {
+    cv.setPointerCapture(e.pointerId);
+    const p = world(e);
+    if (e.button === 1 || e.button === 2) { E.drag = { kind: 'pan', px: p.px, py: p.py, ox: E.ox, oy: E.oy }; return; }
+    switch (E.tool) {
+      case 'room': case 'part': E.draft = { a: { x: snap(p.x, 'x'), z: snap(p.z, 'z') }, b: null }; break;
+      case 'window': case 'door': case 'balcony': case 'entrance': addOpening(E.tool, p); break;
+      case 'scale':
+        if (!E.scaleA || E.scaleB) { E.scaleA = { x: p.x, z: p.z }; E.scaleB = null; q('#peScaleBox').hidden = true; } else {
+          E.scaleB = { x: p.x, z: p.z }; q('#peScaleBox').hidden = false; q('#peScaleLen').value = ''; q('#peScaleLen').focus();
+        }
+        draw(); break;
+      case 'image': if (E.img) E.drag = { kind: 'img', p, x: E.img.x, z: E.img.z }; break;
+      default: {
+        const oi = opAt(p);
+        if (oi >= 0) {
+          E.sel = { op: oi }; renderInsp(); renderRooms(); remember();
+          const o = E.plan.openings[oi]; E.drag = { kind: 'op', o, p, from: o.from, to: o.to, moved: false }; draw(); return;
+        }
+        const h = edgeHit(p);
+        if (h) {
+          const ri = E.plan.rooms.indexOf(h.rm); E.sel = { room: ri, rect: h.rm.rects.indexOf(h.r) }; renderInsp(); renderRooms(); remember();
+          E.drag = { kind: 'edge', rm: h.rm, r: h.r, e: h.e, moved: false }; draw(); return;
+        }
+        const hit = rectAt(p);
+        if (hit) {
+          E.sel = hit; renderInsp(); renderRooms(); remember();
+          const rm = E.plan.rooms[hit.room];
+          E.drag = { kind: 'room', rm, p, grab: rm.rects[hit.rect], base: { rects: rm.rects.map((r) => r.slice()), ops: E.plan.openings.filter((o) => o.room === rm.id).map((o) => [o, o.line, o.from, o.to]) }, moved: false };
+          draw(); return;
+        }
+        E.sel = null; renderInsp(); renderRooms();
+        E.drag = { kind: 'pan', px: p.px, py: p.py, ox: E.ox, oy: E.oy }; draw();
+      }
+    }
+  });
+  cv.addEventListener('pointermove', (e) => {
+    const p = world(e); E.pointer = p;
+    if (E.draft) { E.draft.b = { x: snap(p.x, 'x'), z: snap(p.z, 'z') }; draw(); return; }
+    const d = E.drag;
+    if (!d) {
+      if (E.tool === 'select') { const h = opAt(p) >= 0 ? null : edgeHit(p); cv.style.cursor = opAt(p) >= 0 ? 'grab' : h ? (h.e[0] === 'x' ? 'ew-resize' : 'ns-resize') : rectAt(p) ? 'move' : 'default'; }
+      if (E.tool === 'scale' && E.scaleA && !E.scaleB) draw();
+      return;
+    }
+    if (d.kind === 'pan') { E.ox = d.ox + p.px - d.px; E.oy = d.oy + p.py - d.py; draw(); return; }
+    if (d.kind === 'img') { E.img.x = d.x + p.x - d.p.x; E.img.z = d.z + p.z - d.p.z; draw(); return; }
+    d.moved = true;
+    if (d.kind === 'op') {
+      const ds = round1((d.o.axis === 'x' ? p.x - d.p.x : p.z - d.p.z)); d.o.from = d.from + ds; d.o.to = d.to + ds;
+    } else if (d.kind === 'edge') {
+      setEdge(d.rm, d.r, d.e, snap(d.e[0] === 'x' ? p.x : p.z, d.e[0], d.r));
+    } else if (d.kind === 'room') {
+      const b0 = d.base.rects[d.rm.rects.indexOf(d.grab)], own = new Set(d.rm.rects);
+      const pick = (start, w, ax) => {
+        // ближайшее прилипание любого края ухваченного прямоугольника
+        const a = start + (ax === 'x' ? p.x - d.p.x : p.z - d.p.z), tolSkip = (r) => own.has(r);
+        const best = [[a, 0], [a + w, w]].map(([v, off]) => { const sv = snapOther(v, ax, tolSkip); return sv === null ? null : { v: sv - off, d: Math.abs(sv - v) }; }).filter(Boolean).sort((m, n) => m.d - n.d)[0];
+        return best ? best.v : round1(a);
+      };
+      moveRoom(d.rm, pick(b0[0], b0[2] - b0[0], 'x') - b0[0], pick(b0[1], b0[3] - b0[1], 'z') - b0[1], d.base);
+    }
+    renderChecks(); draw();
+  });
+  const up = () => {
+    if (E.draft) {
+      const { a, b } = E.draft; E.draft = null;
+      if (b && Math.abs(b.x - a.x) >= 0.2 && Math.abs(b.z - a.z) >= 0.2) {
+        const r = [Math.min(a.x, b.x), Math.min(a.z, b.z), Math.max(a.x, b.x), Math.max(a.z, b.z)];
+        remember();
+        if (E.tool === 'part') { const rm = E.plan.rooms[E.sel.room]; rm.rects.push(r); E.sel = { room: E.sel.room, rect: rm.rects.length - 1 }; }
+        else {
+          let n = E.plan.rooms.length + 1, id = 'r' + n; while (E.plan.rooms.some((m) => m.id === id)) id = 'r' + (++n);
+          E.plan.rooms.push({ id, name: `Помещение ${E.plan.rooms.length + 1}`, floor: 'wood', rects: [r] });
+          E.sel = { room: E.plan.rooms.length - 1, rect: 0 };
+        }
+        setTool('select'); renderInsp(); renderRooms(); touch();
+        const nm = q('#peInsp [data-f="name"]'); if (nm) { nm.focus(); nm.select(); }
+      } else draw();
+      return;
+    }
+    const d = E.drag; E.drag = null;
+    if (!d) return;
+    if (d.kind === 'op' || d.kind === 'edge' || d.kind === 'room') { if (!d.moved) E.hist.pop(); else { renderInsp(); renderRooms(); touch(); } }
+    if (d.kind === 'img') saveImg();
+  };
+  cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+  cv.addEventListener('wheel', (e) => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, world(e)); }, { passive: false });
+}
+function snapOther(v, axis, skip) {
+  const tol = 9 / E.s; let best = null, bd = tol;
+  E.plan.rooms.forEach((rm) => rm.rects.forEach((r) => {
+    if (skip(r)) return;
+    const a = axis === 'x' ? r[0] : r[1], b = axis === 'x' ? r[2] : r[3];
+    [a, b, a - E.gap, b + E.gap].forEach((c) => { const d = Math.abs(v - c); if (d < bd) { bd = d; best = c; } });
+  }));
+  return best;
+}
+function zoomAt(k, p) {
+  const px = p ? p.px : E.cw / 2, py = p ? p.py : E.ch / 2, wx = (px - E.ox) / E.s, wz = (py - E.oy) / E.s;
+  E.s = Math.max(6, Math.min(800, E.s * k)); E.ox = px - wx * E.s; E.oy = py - wz * E.s; draw();
+}
+
+/* рисование */
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function draw() {
+  if (!E || !PE.open) return;
+  const d = E.dpr; g.setTransform(d, 0, 0, d, 0, 0); g.clearRect(0, 0, E.cw, E.ch);
+  const ink = cssVar('--ink'), accent = cssVar('--accent'), muted = cssVar('--muted'), warn = cssVar('--warn');
+  // сетка 1 м
+  const step = E.s > 25 ? 1 : 5;
+  g.strokeStyle = cssVar('--line'); g.lineWidth = 1; g.beginPath();
+  for (let x = Math.floor(-E.ox / E.s / step) * step; sx(x) < E.cw; x += step) { g.moveTo(sx(x), 0); g.lineTo(sx(x), E.ch); }
+  for (let z = Math.floor(-E.oy / E.s / step) * step; sy(z) < E.ch; z += step) { g.moveTo(0, sy(z)); g.lineTo(E.cw, sy(z)); }
+  g.stroke();
+  if (E.img && E.img.el.naturalWidth) {
+    g.save(); g.globalAlpha = E.img.opacity; g.translate(sx(E.img.x), sy(E.img.z)); g.rotate(E.img.rot * Math.PI / 2); g.scale(E.img.mpp * E.s, E.img.mpp * E.s); g.drawImage(E.img.el, 0, 0); g.restore();
+  }
+  const fills = { wood: 'rgba(196,160,110,0.34)', tile: 'rgba(90,140,190,0.34)', deck: 'rgba(130,130,130,0.30)' };
+  g.font = '12px ' + cssVar('--font-num'); g.textAlign = 'center'; g.textBaseline = 'middle';
+  E.plan.rooms.forEach((rm, i) => {
+    const on = E.sel && E.sel.room === i;
+    rm.rects.forEach((r, j) => {
+      g.fillStyle = fills[rm.floor] || fills.wood; g.fillRect(sx(r[0]), sy(r[1]), (r[2] - r[0]) * E.s, (r[3] - r[1]) * E.s);
+      g.strokeStyle = on ? accent : ink; g.lineWidth = on && E.sel.rect === j ? 2.5 : on ? 1.5 : 1.2; g.strokeRect(sx(r[0]), sy(r[1]), (r[2] - r[0]) * E.s, (r[3] - r[1]) * E.s);
+      if (E.s > 28) {
+        g.fillStyle = on ? accent : muted;
+        if ((r[2] - r[0]) * E.s > 46) g.fillText(String(mmOf(r[2] - r[0])), sx((r[0] + r[2]) / 2), sy(r[1]) + 10);
+        if ((r[3] - r[1]) * E.s > 46) { g.save(); g.translate(sx(r[2]) - 10, sy((r[1] + r[3]) / 2)); g.rotate(-Math.PI / 2); g.fillText(String(mmOf(r[3] - r[1])), 0, 0); g.restore(); }
+      }
+    });
+    const big = rm.rects.slice().sort((a, b) => (b[2] - b[0]) * (b[3] - b[1]) - (a[2] - a[0]) * (a[3] - a[1]))[0], cx = sx((big[0] + big[2]) / 2), cy = sy((big[1] + big[3]) / 2);
+    // подпись с обводкой, чтобы читалась поверх подложки
+    g.fillStyle = ink; g.strokeStyle = cssVar('--panel'); g.lineWidth = 3; g.lineJoin = 'round';
+    g.font = '600 13px ' + cssVar('--font-ui'); g.strokeText(rm.name, cx, cy - 8); g.fillText(rm.name, cx, cy - 8);
+    const areaText = `${fmt(roomArea(rm), 2)} м²`;
+    g.font = '12px ' + cssVar('--font-num'); g.strokeText(areaText, cx, cy + 8); g.fillText(areaText, cx, cy + 8);
+  });
+  E.plan.openings.forEach((o, i) => {
+    const on = E.sel && E.sel.op === i, P = (s, w) => (o.axis === 'x' ? [sx(s), sy(w)] : [sx(w), sy(s)]);
+    g.strokeStyle = on ? accent : o.type === 'window' ? '#2E7BC4' : o.type === 'entrance' ? '#1C1C1C' : '#A5502D'; g.lineWidth = on ? 6 : 4; g.lineCap = 'butt';
+    g.beginPath(); g.moveTo(...P(o.from, o.line)); g.lineTo(...P(o.to, o.line)); g.stroke();
+    if (o.type !== 'window') {
+      // полотно и дуга открывания
+      const w = o.to - o.from, hs = o.hinge ? o.to : o.from, ds = o.hinge ? -1 : 1, tip = P(hs, o.line + o.side * w), start = P(hs + ds * w, o.line), h = P(hs, o.line);
+      g.lineWidth = 1.5; g.beginPath(); g.moveTo(...h); g.lineTo(...tip); g.stroke();
+      g.setLineDash([4, 3]); g.beginPath(); g.moveTo(...tip); g.quadraticCurveTo(...P(hs + ds * w, o.line + o.side * w), ...start); g.stroke(); g.setLineDash([]);
+    }
+  });
+  if (E.draft && E.draft.b) {
+    const { a, b } = E.draft; g.fillStyle = 'rgba(46,75,211,0.15)'; g.strokeStyle = accent; g.lineWidth = 2;
+    g.fillRect(sx(Math.min(a.x, b.x)), sy(Math.min(a.z, b.z)), Math.abs(b.x - a.x) * E.s, Math.abs(b.z - a.z) * E.s);
+    g.strokeRect(sx(Math.min(a.x, b.x)), sy(Math.min(a.z, b.z)), Math.abs(b.x - a.x) * E.s, Math.abs(b.z - a.z) * E.s);
+    g.fillStyle = accent; g.font = '12px ' + cssVar('--font-num'); g.fillText(`${mmOf(Math.abs(b.x - a.x))} × ${mmOf(Math.abs(b.z - a.z))}`, sx((a.x + b.x) / 2), sy((a.z + b.z) / 2));
+  }
+  if (E.tool === 'scale' && E.scaleA) {
+    const B = E.scaleB || E.pointer || E.scaleA;
+    g.strokeStyle = warn; g.lineWidth = 2; g.beginPath(); g.moveTo(sx(E.scaleA.x), sy(E.scaleA.z)); g.lineTo(sx(B.x), sy(B.z)); g.stroke();
+    g.fillStyle = warn; [E.scaleA, B].forEach((p) => { g.beginPath(); g.arc(sx(p.x), sy(p.z), 4, 0, 7); g.fill(); });
+  }
+}
+
+/* панель редактора */
+function field(label, f, val, attrs = '') { return `<label class="field"><span>${label}</span><input type="number" data-f="${f}" value="${val}" ${attrs}></label>`; }
+function renderInsp() {
+  const box = q('#peInsp'); box.innerHTML = '';
+  q('#pePartBtn').disabled = !(E.sel && E.sel.room !== undefined);
+  if (!E.sel) { box.innerHTML = `<p class="empty">${E.plan.rooms.length ? 'Выберите комнату или проём на чертеже, чтобы вписать размеры.' : 'Нарисуйте первую комнату: инструмент «Комната» уже выбран.'}</p>`; return; }
+  if (E.sel.op !== undefined) {
+    const o = E.plan.openings[E.sel.op]; if (!o) { E.sel = null; renderInsp(); return; }
+    const rm = E.plan.rooms.find((m) => m.id === o.room);
+    const edge = rm && rm.rects.find((r) => o.axis === 'x' ? (Math.abs(r[1] - o.line) < 0.002 || Math.abs(r[3] - o.line) < 0.002) : (Math.abs(r[0] - o.line) < 0.002 || Math.abs(r[2] - o.line) < 0.002));
+    const start = edge ? (o.axis === 'x' ? edge[0] : edge[1]) : 0;
+    box.dataset.start = start;
+    box.innerHTML = `<label class="field"><span>Тип</span><select data-f="type">${OPENING_TYPES.map((t) => `<option value="${t}"${t === o.type ? ' selected' : ''}>${OP_NAMES[t]}</option>`).join('')}</select></label>
+      <div class="pe-grid">${field('Ширина, мм', 'opW', mmOf(o.to - o.from), 'min="200" step="1"')}${edge ? field('От угла стены, мм', 'opS', mmOf(o.from - start), 'step="1"') : ''}
+      ${o.type === 'window' ? field('Подоконник, мм', 'sill', mmOf(o.sill === undefined ? 0.8 : o.sill), 'min="0" step="10"') : ''}
+      ${field('Верх от пола, мм', 'top', o.top ? mmOf(o.top) : '', `min="500" step="10" placeholder="${o.type === 'window' ? 'до 30 см от потолка' : o.type === 'balcony' ? '2200' : '2100'}"`)}</div>
+      <div class="btnrow">${o.type === 'window' ? '' : '<button type="button" class="btn" data-a="hinge">Другая петля</button><button type="button" class="btn" data-a="side">Открывать в другую сторону</button>'}
+      <button type="button" class="btn danger" data-a="delop">Удалить</button></div>`;
+    return;
+  }
+  const rm = E.plan.rooms[E.sel.room]; if (!rm) { E.sel = null; renderInsp(); return; }
+  const st = rectStats(rm.rects);
+  box.innerHTML = `<label class="field"><span>Название</span><input type="text" data-f="name" maxlength="60"></label>
+    <label class="field"><span>Пол</span><select data-f="floor">${FLOOR_KINDS.map((k) => `<option value="${k}"${k === rm.floor ? ' selected' : ''}>${FLOOR_NAMES[k]}</option>`).join('')}</select></label>
+    <div class="pe-grid">${field('Площадь по замеру, м²', 'area', rm.area || '', `step="0.001" min="0" placeholder="${fmt(st.area, 3).replace(',', '.')}"`)}${field('Периметр по замеру, м', 'perimeter', rm.perimeter || '', `step="0.001" min="0" placeholder="${st.per.toFixed(3)}"`)}</div>
+    ${rm.rects.map((r, j) => `<div class="pe-part${j === E.sel.rect ? ' on' : ''}" data-part="${j}"><b>${rm.rects.length > 1 ? 'Часть ' + (j + 1) : 'Размеры'}</b>
+      <div class="pe-grid">${field('Ширина →, мм', 'w' + j, mmOf(r[2] - r[0]), 'min="100" step="1"')}${field('Глубина ↓, мм', 'd' + j, mmOf(r[3] - r[1]), 'min="100" step="1"')}
+      ${field('Левый край X, мм', 'x' + j, mmOf(r[0]), 'step="1"')}${field('Верхний край Z, мм', 'z' + j, mmOf(r[1]), 'step="1"')}</div>
+      ${rm.rects.length > 1 ? `<div class="btnrow"><button type="button" class="btn danger" data-a="delpart" data-j="${j}">Удалить часть</button></div>` : ''}</div>`).join('')}
+    <div class="btnrow"><button type="button" class="btn" data-tool="part">Добавить часть</button><button type="button" class="btn danger" data-a="delroom">Удалить комнату</button></div>`;
+  box.querySelector('[data-f="name"]').value = rm.name;
+}
+function renderRooms() {
+  const ul = q('#peRooms'); ul.innerHTML = ''; let total = 0;
+  E.plan.rooms.forEach((rm, i) => {
+    const a = rm.area || roomArea(rm); total += a;
+    const li = document.createElement('li'); li.setAttribute('aria-selected', String(!!E.sel && E.sel.room === i));
+    li.innerHTML = '<span></span><small></small>'; li.firstChild.textContent = rm.name; li.lastChild.textContent = `${fmt(a, 2)} м²`;
+    li.addEventListener('click', () => { E.sel = { room: i, rect: 0 }; renderInsp(); renderRooms(); draw(); });
+    ul.appendChild(li);
+  });
+  q('#peTotal').textContent = E.plan.rooms.length ? `Итого ${fmt(total, 2)} м²` : 'Пока пусто.';
+}
+function checks() {
+  const P = E.plan, errs = [], warns = [], R = P.rooms;
+  if (!R.length) errs.push('Нарисуйте хотя бы одну комнату.');
+  for (let a = 0; a < R.length; a++) for (let b = a + 1; b < R.length; b++) {
+    let over = false, touch_ = false;
+    R[a].rects.forEach((p) => R[b].rects.forEach((r) => {
+      const ox = Math.min(p[2], r[2]) - Math.max(p[0], r[0]), oz = Math.min(p[3], r[3]) - Math.max(p[1], r[1]);
+      if (ox > 0.005 && oz > 0.005) over = true; else if ((ox > 0.05 && oz > -0.04) || (oz > 0.05 && ox > -0.04)) touch_ = true;
+    }));
+    if (over) errs.push(`«${R[a].name}» и «${R[b].name}» наезжают друг на друга.`);
+    else if (touch_) warns.push(`Между «${R[a].name}» и «${R[b].name}» нет места на стену.`);
+  }
+  const onEdge = (o, rm) => rm.rects.some((r) => {
+    const [lo, hi, e0, e1] = o.axis === 'x' ? [r[0], r[2], r[1], r[3]] : [r[1], r[3], r[0], r[2]], s = (o.from + o.to) / 2;
+    return s >= lo && s <= hi && (Math.abs(e0 - o.line) < 0.6 || Math.abs(e1 - o.line) < 0.6);
+  });
+  R.forEach((rm) => {
+    const st = rectStats(rm.rects);
+    if (rm.area && Math.abs(st.area - rm.area) / rm.area > 0.03) warns.push(`«${rm.name}»: нарисовано ${fmt(st.area, 2)} м², по замеру ${fmt(rm.area, 2)} м². Проверьте размеры.`);
+    if (!P.openings.some((o) => o.type !== 'window' && onEdge(o, rm))) warns.push(`В «${rm.name}» нет двери.`);
+  });
+  P.openings.forEach((o) => {
+    if (!R.some((rm) => rm.rects.some((r) => (o.axis === 'x' ? [r[1], r[3]] : [r[0], r[2]]).some((e) => Math.abs(e - o.line) < 0.002)))) warns.push(`${OP_NAMES[o.type]} не лежит на стене комнаты и может не построиться.`);
+  });
+  return { errs, warns };
+}
+function renderChecks() {
+  const { errs, warns } = checks(), ul = q('#peChecks'); ul.innerHTML = '';
+  errs.forEach((t) => { const li = document.createElement('li'); li.className = 'err'; li.textContent = t; ul.appendChild(li); });
+  warns.forEach((t) => { const li = document.createElement('li'); li.className = 'warn'; li.textContent = t; ul.appendChild(li); });
+  if (!errs.length && !warns.length) { const li = document.createElement('li'); li.textContent = 'Всё в порядке.'; ul.appendChild(li); }
+  q('#peBuild').disabled = errs.length > 0;
+}
+function applyField(f, raw) {
+  const P = E.plan, num = parseFloat(raw), mm = num / 1000;
+  if (E.sel && E.sel.op !== undefined) {
+    const o = P.openings[E.sel.op]; if (!o) return;
+    if (f === 'type') { o.type = raw; if (raw === 'window' && o.sill === undefined) o.sill = 0.8; renderInsp(); }
+    else if (f === 'opW' && num >= 200) { const c = (o.from + o.to) / 2; o.from = c - mm / 2; o.to = c + mm / 2; }
+    else if (f === 'opS' && isFinite(num)) { const w = o.to - o.from; o.from = parseFloat(q('#peInsp').dataset.start) + mm; o.to = o.from + w; }
+    else if (f === 'sill' && num >= 0) o.sill = mm;
+    else if (f === 'top') { if (num >= 500) o.top = mm; else delete o.top; }
+    return;
+  }
+  if (!E.sel || E.sel.room === undefined) return;
+  const rm = P.rooms[E.sel.room]; if (!rm) return;
+  if (f === 'name') { rm.name = raw; renderRooms(); return; }
+  if (f === 'floor') { rm.floor = raw; return; }
+  if (f === 'area' || f === 'perimeter') { if (num > 0) rm[f] = num; else delete rm[f]; renderRooms(); return; }
+  const j = parseInt(f.slice(1), 10), r = rm.rects[j]; if (!r || !isFinite(num)) return;
+  if (f[0] === 'w' && num >= 100) setEdge(rm, r, 'x1', r[0] + mm);
+  else if (f[0] === 'd' && num >= 100) setEdge(rm, r, 'z1', r[1] + mm);
+  else if (f[0] === 'x' || f[0] === 'z') {
+    // сдвиг части: проёмы на её гранях едут вместе с ней
+    const ix = f[0] === 'x' ? 0 : 1, dv = mm - r[ix]; if (!dv) return;
+    E.plan.openings.forEach((o) => {
+      if (o.room !== rm.id) return;
+      const across = o.axis === (ix === 0 ? 'z' : 'x');
+      if (across && (Math.abs(o.line - r[ix]) < 0.002 || Math.abs(o.line - r[ix + 2]) < 0.002)) o.line += dv;
+    });
+    r[ix] += dv; r[ix + 2] += dv;
+  }
+  renderRooms();
+}
+function renderImgBox() {
+  const m = E.img;
+  q('#peImgBox').hidden = !m; q('#peScaleBtn').disabled = !m;
+  if (m) q('#peOpacity').value = m.opacity;
+  q('#pePageBox').hidden = !E.pdf;
+  if (E.pdf) { q('#pePage').max = E.pdf.numPages; q('#pePage').value = E.pdfPage || 1; }
+}
+function saveImg() {
+  if (!E.img) { rawStore.del(imgKey(E.plan.id)); return; }
+  const { src, x, z, mpp, rot, opacity } = E.img;
+  if (!rawStore.set(imgKey(E.plan.id), { src, x, z, mpp, rot, opacity })) q('#peImgNote').textContent = 'Подложка слишком большая и не сохранится после закрытия. Сама планировка сохранится.';
+}
+function setImage(canvasOrImg, w, h) {
+  // подложка уменьшается, чтобы поместиться в хранилище браузера
+  const k = Math.min(1, 2200 / Math.max(w, h)), c = document.createElement('canvas');
+  c.width = Math.round(w * k); c.height = Math.round(h * k);
+  const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(canvasOrImg, 0, 0, c.width, c.height);
+  const src = c.toDataURL('image/jpeg', 0.8), el = new Image();
+  el.onload = () => {
+    const old = E.img;
+    E.img = { src, el, x: old ? old.x : 0, z: old ? old.z : 0, mpp: old ? old.mpp : 12 / c.width, rot: old ? old.rot : 0, opacity: old ? old.opacity : 0.6 };
+    saveImg(); renderImgBox(); fit(); setTool('scale');
+    status_(old ? '' : 'Теперь задайте масштаб: отметьте две точки с известным расстоянием.');
+  };
+  el.src = src;
+}
+function loadScript(src) { return new Promise((ok, no) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = no; document.head.appendChild(s); }); }
+async function pdfLib() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  for (const b of ['lib/pdfjs/', 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/']) {
+    try { await loadScript(b + 'pdf.min.js'); window.pdfjsLib.GlobalWorkerOptions.workerSrc = b + 'pdf.worker.min.js'; return window.pdfjsLib; } catch (e) { /* следующий источник */ }
+  }
+  throw new Error('pdf');
+}
+async function renderPdfPage(n) {
+  const page = await E.pdf.getPage(n), v0 = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: 2200 / Math.max(v0.width, v0.height) });
+  const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
+  const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: x, viewport: vp }).promise;
+  E.pdfPage = n; setImage(c, c.width, c.height);
+}
+async function loadFile(file) {
+  status_('Открываю файл…');
+  try {
+    if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+      const lib = await pdfLib();
+      E.pdf = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
+      E.img = null; await renderPdfPage(1);
+    } else {
+      E.pdf = null; E.img = null;
+      const url = URL.createObjectURL(file), el = new Image();
+      await new Promise((ok, no) => { el.onload = ok; el.onerror = no; el.src = url; });
+      setImage(el, el.naturalWidth, el.naturalHeight); URL.revokeObjectURL(url);
+    }
+  } catch (e) { status_('Не получилось открыть файл. Сохраните план как картинку (PNG или JPEG) и загрузите её.', true); }
+}
+function build() {
+  const { errs } = checks(); if (errs.length) return;
+  let p;
+  try { p = sanitizePlan(E.plan); } catch (e) { status_(e.message, true); return; }
+  p.id = E.plan.id;
+  if (!storePlan(p)) { status_('Не хватило места в браузере: удалите ненужные планировки.', true); return; }
+  if (E.plan.fromDefault) LAYOUT_KEYS.forEach((k) => { const v = rawStore.get('flat3d.' + k); if (v) rawStore.set(`flat3d.p.${p.id}.${k}`, v); });
+  if (E.plan.fresh) rawStore.del(DRAFT_KEY);
+  activate(p.id);
+}
+function bindDom() {
+  bindCanvas();
+  root.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-tool]'); if (t && !t.disabled) { setTool(t.dataset.tool); return; }
+    const a = e.target.closest('[data-a]');
+    if (a) {
+      remember();
+      const P = E.plan, o = E.sel && E.sel.op !== undefined ? P.openings[E.sel.op] : null;
+      switch (a.dataset.a) {
+        case 'hinge': o.hinge = o.hinge ? 0 : 1; break;
+        case 'side': o.side = -o.side; break;
+        case 'delop': P.openings.splice(E.sel.op, 1); E.sel = null; break;
+        case 'delpart': { const rm = P.rooms[E.sel.room]; rm.rects.splice(+a.dataset.j, 1); E.sel.rect = 0; break; }
+        case 'delroom': { const rm = P.rooms[E.sel.room]; P.openings = P.openings.filter((x) => x.room !== rm.id); P.rooms.splice(E.sel.room, 1); E.sel = null; break; }
+      }
+      renderInsp(); renderRooms(); touch(); return;
+    }
+    const part = e.target.closest('[data-part]');
+    if (part && E.sel && +part.dataset.part !== E.sel.rect) {
+      E.sel.rect = +part.dataset.part;
+      root.querySelectorAll('[data-part]').forEach((x) => x.classList.toggle('on', +x.dataset.part === E.sel.rect)); draw();
+    }
+  });
+  const insp = q('#peInsp');
+  let before = null;
+  insp.addEventListener('focusin', () => { before = JSON.stringify(E.plan); });
+  insp.addEventListener('input', (e) => { const f = e.target.dataset.f; if (f) { applyField(f, e.target.value); touch(); } });
+  insp.addEventListener('change', () => { const now = JSON.stringify(E.plan); if (before && before !== now) { E.hist.push(before); before = now; } });
+  q('#peName').addEventListener('input', (e) => { E.plan.name = e.target.value; touch(); });
+  q('#peCeil').addEventListener('input', (e) => { const v = parseFloat(e.target.value); if (v >= 2400 && v <= 3300) E.plan.ceiling = v / 1000; touch(); });
+  q('#peWall').addEventListener('input', (e) => { const v = parseFloat(e.target.value); if (v >= 50 && v <= 600) E.plan.wall = v / 1000; touch(); });
+  q('#peGap').addEventListener('input', (e) => { const v = parseFloat(e.target.value); if (v >= 0) E.gap = v / 1000; });
+  q('#peImg').addEventListener('change', (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) loadFile(f); });
+  q('#peOpacity').addEventListener('input', (e) => { E.img.opacity = parseFloat(e.target.value); draw(); });
+  q('#peOpacity').addEventListener('change', saveImg);
+  q('#pePage').addEventListener('change', (e) => { const n = parseInt(e.target.value, 10); if (E.pdf && n >= 1 && n <= E.pdf.numPages) renderPdfPage(n); });
+  q('#peRot').addEventListener('click', () => { E.img.rot = (E.img.rot + 1) % 4; saveImg(); fit(); draw(); });
+  q('#peImgDel').addEventListener('click', () => { E.img = null; E.pdf = null; saveImg(); renderImgBox(); if (E.tool === 'scale' || E.tool === 'image') setTool('select'); draw(); });
+  q('#peScaleOk').addEventListener('click', () => {
+    const L = parseFloat(q('#peScaleLen').value) / 1000, A = E.scaleA, B = E.scaleB;
+    if (!(L > 0) || !A || !B) { status_('Впишите расстояние в миллиметрах.', true); return; }
+    const cur = Math.hypot(B.x - A.x, B.z - A.z); if (cur < 1e-6) return;
+    const k = L / cur, m = E.img; m.x = A.x + (m.x - A.x) * k; m.z = A.z + (m.z - A.z) * k; m.mpp *= k;
+    saveImg(); setTool(E.plan.rooms.length ? 'select' : 'room'); fit(); status_('Масштаб задан.'); draw();
+  });
+  q('#peBuild').addEventListener('click', build);
+  q('#peUndo').addEventListener('click', undo);
+  q('#peExport').addEventListener('click', async () => {
+    try { await savePlanFile(sanitizePlan(E.plan)); status_('Файл плана сохранён.'); }
+    catch (e) { if (!e || e.code !== 'declined') status_(e && e.message && !e.code ? e.message : 'Не получилось скачать файл.', true); }
+  });
+  q('#peClose').addEventListener('click', closeEditor);
+  q('#peFit').addEventListener('click', () => { fit(); draw(); });
+  q('#peZoomIn').addEventListener('click', () => zoomAt(1.25));
+  q('#peZoomOut').addEventListener('click', () => zoomAt(0.8));
+  new ResizeObserver(() => { if (PE.open) { resizeCv(); draw(); } }).observe(q('.pe-stage'));
+  // пока открыт редактор, клавиши не должны двигать камеру и удалять мебель за ним
+  window.addEventListener('keydown', (e) => {
+    if (!PE.open) return;
+    e.stopImmediatePropagation();
+    const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !typing) { e.preventDefault(); undo(); return; }
+    if (typing) return;
+    if (e.key === 'Escape') { E.draft = null; setTool('select'); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      const b = E.sel && (E.sel.op !== undefined ? root.querySelector('[data-a="delop"]') : root.querySelector('[data-a="delroom"]'));
+      if (b) { e.preventDefault(); b.click(); }
+    }
+  }, true);
+  window.addEventListener('keyup', (e) => { if (PE.open) e.stopImmediatePropagation(); }, true);
+}
+}
 })();
 </script>
 
