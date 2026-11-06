@@ -3723,13 +3723,367 @@ function loop(now) {
 }
 requestAnimationFrame(loop);
 
+/* ------------------------------------------------------------------
+   Распознавание плана по картинке, без сервера: всё считается в браузере.
+   Прямые горизонтальные и вертикальные линии — стены и окна; косые (полотна дверей, дуги) и мелочь (текст) отбрасываются.
+   Комнаты — свободные области, которые не проходят через дверной проём: ищем их от крупных к мелким, «просеивая» квадратом.
+------------------------------------------------------------------- */
+const Recog = (() => {
+  const inkMask = (img, th) => {
+    const { width: W, height: H, data: D } = img, m = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) { const r = D[i * 4], g = D[i * 4 + 1], b = D[i * 4 + 2], mx = Math.max(r, g, b); m[i] = mx < th && mx - Math.min(r, g, b) < 60 ? 1 : 0; } // цветные пометки — не план
+    return m;
+  };
+  function label(mask, W, H, conn8) {
+    const lab = new Int32Array(W * H), sizes = [0], boxes = [null], st = [];
+    for (let s = 0; s < W * H; s++) {
+      if (!mask[s] || lab[s]) continue;
+      const id = sizes.length, b = [W, H, -1, -1]; let n = 0; lab[s] = id; st.push(s);
+      while (st.length) {
+        const c = st.pop(), x = c % W, y = (c - x) / W; n++;
+        if (x < b[0]) b[0] = x; if (y < b[1]) b[1] = y; if (x > b[2]) b[2] = x; if (y > b[3]) b[3] = y;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          if ((!dx && !dy) || (!conn8 && dx && dy)) continue;
+          const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const k = ny * W + nx; if (mask[k] && !lab[k]) { lab[k] = id; st.push(k); }
+        }
+      }
+      sizes.push(n); boxes.push(b);
+    }
+    return { lab, sizes, boxes };
+  }
+  // Расстояние Чебышева до ближайшей отмеченной клетки: квадратное окно точно восстанавливает прямоугольники.
+  function cheb(m, W, H) {
+    const d = new Int32Array(W * H);
+    for (let i = 0; i < d.length; i++) d[i] = m[i] ? 0 : 1e6;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const c = y * W + x; let v = d[c];
+      if (x && d[c - 1] + 1 < v) v = d[c - 1] + 1;
+      if (y) { if (d[c - W] + 1 < v) v = d[c - W] + 1; if (x && d[c - W - 1] + 1 < v) v = d[c - W - 1] + 1; if (x < W - 1 && d[c - W + 1] + 1 < v) v = d[c - W + 1] + 1; }
+      d[c] = v; }
+    for (let y = H - 1; y >= 0; y--) for (let x = W - 1; x >= 0; x--) { const c = y * W + x; let v = d[c];
+      if (x < W - 1 && d[c + 1] + 1 < v) v = d[c + 1] + 1;
+      if (y < H - 1) { if (d[c + W] + 1 < v) v = d[c + W] + 1; if (x < W - 1 && d[c + W + 1] + 1 < v) v = d[c + W + 1] + 1; if (x && d[c + W - 1] + 1 < v) v = d[c + W - 1] + 1; }
+      d[c] = v; }
+    return d;
+  }
+  const dilate = (m, W, H, r) => { const d = cheb(m, W, H), o = new Uint8Array(W * H); for (let i = 0; i < o.length; i++) o[i] = d[i] <= r ? 1 : 0; return o; };
+  function axisRuns(ink, W, H, L) {
+    const out = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) { let x = 0;
+      const hit = (p) => ink[y * W + p] || (y && ink[(y - 1) * W + p]) || (y < H - 1 && ink[(y + 1) * W + p]); // допуск на перекос скана
+      while (x < W) { if (!hit(x)) { x++; continue; } let e = x; while (e < W && hit(e)) e++; if (e - x >= L) for (let i = x; i < e; i++) if (ink[y * W + i]) out[y * W + i] = 1; x = e; } }
+    for (let x = 0; x < W; x++) { let y = 0;
+      const hit = (p) => ink[p * W + x] || (x && ink[p * W + x - 1]) || (x < W - 1 && ink[p * W + x + 1]);
+      while (y < H) { if (!hit(y)) { y++; continue; } let e = y; while (e < H && hit(e)) e++; if (e - y >= L) for (let i = y; i < e; i++) if (ink[i * W + x]) out[i * W + x] = 1; y = e; } }
+    return out;
+  }
+  // Самые большие прямоугольники, пока не покроют маску внутри окна box.
+  function maxRects(mask, W, box, minSide, minArea, maxN) {
+    const [x0, y0, x1, y1] = box, w = x1 - x0 + 1, h = y1 - y0 + 1, m = new Uint8Array(w * h), out = [];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) m[y * w + x] = mask[(y + y0) * W + x + x0];
+    for (let n = 0; n < maxN; n++) {
+      const hg = new Int32Array(w); let best = null, A = minArea;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) hg[x] = m[y * w + x] ? hg[x] + 1 : 0;
+        const st = [];
+        for (let x = 0; x <= w; x++) {
+          const c = x < w ? hg[x] : 0; let s = x;
+          while (st.length && st[st.length - 1][1] >= c) {
+            const [sx, sh] = st.pop(), rw = x - sx;
+            if (rw >= minSide && sh >= minSide && rw * sh > A) { A = rw * sh; best = [sx, y - sh + 1, x, y + 1]; }
+            s = sx;
+          }
+          st.push([s, c]);
+        }
+      }
+      if (!best) break;
+      for (let y = best[1]; y < best[3]; y++) m.fill(0, y * w + best[0], y * w + best[2]);
+      out.push([best[0] + x0, best[1] + y0, best[2] + x0, best[3] + y0]);
+    }
+    return out;
+  }
+  function run(img, totalArea) {
+    const W = img.width, H = img.height, N = W * H, raw = inkMask(img, 215), dark = inkMask(img, 140);
+    // контур здания — самый большой связный каркас из прямых тёмных линий
+    const boxOf = (() => {
+      const l = axisRuns(dark, W, H, Math.round(Math.max(W, H) * 0.02)), g = dilate(l, W, H, 2), C = label(g, W, H, true);
+      let big = 1; C.sizes.forEach((s, i) => { if (s > C.sizes[big]) big = i; });
+      return C.boxes[big];
+    })();
+    if (!boxOf) throw new Error('На картинке не нашлось стен.');
+    let ppm = Math.sqrt((boxOf[2] - boxOf[0]) * (boxOf[3] - boxOf[1]) * 0.75 / totalArea);
+    // текст и мелочь
+    const C0 = label(raw, W, H, true), ink = new Uint8Array(N), big0 = 0.7 * ppm;
+    for (let i = 0; i < N; i++) if (raw[i]) { const b = C0.boxes[C0.lab[i]]; if (Math.max(b[2] - b[0], b[3] - b[1]) >= big0) ink[i] = 1; }
+    const lines = axisRuns(ink, W, H, Math.round(0.25 * ppm));
+    // каркас + вытянутые отрезки внутри контура; таблицы и логотипы — нет
+    const G = label(dilate(lines, W, H, 2), W, H, true);
+    let big = 1; G.sizes.forEach((s, i) => { if (s > G.sizes[big]) big = i; });
+    const box = G.boxes[big], keep = G.boxes.map((b, i) => { if (!i) return false; if (i === big) return true; const w = b[2] - b[0] + 1, h = b[3] - b[1] + 1;
+      return b[0] >= box[0] - 12 && b[2] <= box[2] + 12 && b[1] >= box[1] - 12 && b[3] <= box[3] + 12 && Math.max(w, h) >= 4 * Math.min(w, h); });
+    const skel = new Uint8Array(N); for (let i = 0; i < N; i++) if (lines[i] && keep[G.lab[i]]) skel[i] = 1;
+    const wallsD = dilate(skel, W, H, 1);
+    const solid = (() => { const free = new Uint8Array(N); for (let i = 0; i < N; i++) free[i] = wallsD[i] ? 0 : 1; const d = cheb(free, W, H), s = new Uint8Array(N); for (let i = 0; i < N; i++) s[i] = d[i] >= 3 ? 1 : 0; return s; })();
+    let claim, nClaim;
+    for (let pass = 0; pass < 2; pass++) {
+      claim = new Int32Array(N); nClaim = 2; // 1 — улица, 2… — комнаты
+      for (const tm of [1.6, 1.2, 0.9, 0.7, 0.55, 0.42, 0.33]) {
+        const T = Math.max(2, Math.round(tm * ppm)), block = new Uint8Array(N);
+        for (let i = 0; i < N; i++) block[i] = wallsD[i] || claim[i] ? 1 : 0;
+        const d = cheb(block, W, H), core = new Uint8Array(N); for (let i = 0; i < N; i++) core[i] = d[i] > T ? 1 : 0;
+        const L = label(core, W, H, false);
+        for (let id = 1; id < L.sizes.length; id++) {
+          const b = L.boxes[id], x0 = Math.max(0, b[0] - T - 1), y0 = Math.max(0, b[1] - T - 1), x1 = Math.min(W - 1, b[2] + T + 1), y1 = Math.min(H - 1, b[3] + T + 1), w = x1 - x0 + 1, h = y1 - y0 + 1;
+          const sub = new Uint8Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (L.lab[(y + y0) * W + x + x0] === id) sub[y * w + x] = 1;
+          const dd = cheb(sub, w, h), cells = []; for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const c = (y + y0) * W + x + x0; if (dd[y * w + x] <= T + 1 && !block[c]) cells.push(c); }
+          if (cells.length < 0.5 * ppm * ppm) continue;
+          const out = b[0] <= T + 2 || b[1] <= T + 2 || b[2] >= W - T - 3 || b[3] >= H - T - 3;
+          const v = out ? 1 : ++nClaim; cells.forEach((c) => { claim[c] = v; });
+        }
+      }
+      let px = 0; for (let i = 0; i < N; i++) if (claim[i] > 1) px++;
+      if (!px) break;
+      const next = Math.sqrt(px / totalArea); if (Math.abs(next - ppm) < 0.02 * ppm) { ppm = next; break; } ppm = next;
+    }
+    // Швы между областями: длинный шов без линий — это одно помещение, короткий — дверь.
+    const seam = new Map(), per = new Map(), parent = new Map(), find = (a) => { while (parent.has(a)) a = parent.get(a); return a; }, key = (a, b) => (a < b ? a * 1e5 + b : b * 1e5 + a);
+    for (let y = 1; y < H - 4; y++) for (let x = 1; x < W - 4; x++) { const c = y * W + x, a = claim[c]; if (!a) continue;
+      for (const st of [1, W]) { const nb = claim[c + st]; if (nb === a) continue; per.set(a, (per.get(a) || 0) + 1);
+        for (let k = 1; k <= 4; k++) { const v = claim[c + st * k]; if (v && v !== a) { const K = key(a, v); seam.set(K, (seam.get(K) || 0) + 1); break; } if (wallsD[c + st * k]) break; } } }
+    const seams = [...seam.entries()].map(([K, n]) => [Math.floor(K / 1e5), K % 1e5, n]);
+    seams.forEach(([a, b, n]) => { if (a > 1 && n >= 1.0 * ppm) { const A = find(a), B = find(b); if (A !== B) parent.set(A, B); } });
+    seams.forEach(([a, b, n]) => { if (a === 1 && n >= 0.3 * (per.get(b) || 1e9)) parent.set(find(b), 1); });
+    for (let i = 0; i < N; i++) if (claim[i]) claim[i] = find(claim[i]);
+    let rooms = [], ops = [], roomAtPx = null;
+    const reach = Math.round(0.75 * ppm), isOut = (c) => claim[c] === 1;
+    function buildRooms() {
+      // Вмятины от мебели и сантехники (линии в комнате) заполняем, если рядом нет других помещений.
+      const ids = [...new Set(claim)].filter((v) => v > 1); rooms = [];
+      ids.forEach((id) => {
+        const m = new Uint8Array(N); const bb = [W, H, -1, -1]; let a = 0;
+        for (let i = 0; i < N; i++) if (claim[i] === id) { m[i] = 1; a++; const x = i % W, y = (i - x) / W; if (x < bb[0]) bb[0] = x; if (y < bb[1]) bb[1] = y; if (x > bb[2]) bb[2] = x; if (y > bb[3]) bb[3] = y; }
+        if (a < 0.5 * ppm * ppm) return;
+        const w = bb[2] - bb[0] + 1, h = bb[3] - bb[1] + 1, dent = new Uint8Array(w * h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) dent[y * w + x] = m[(y + bb[1]) * W + x + bb[0]] ? 0 : 1;
+        const D = label(dent, w, h, false), mg = Math.max(2, Math.round(0.05 * ppm));
+        for (let dId = 1; dId < D.sizes.length; dId++) {
+          if (D.sizes[dId] > 0.4 * a) continue;
+          let bad = false;
+          for (let y = 0; y < h && !bad; y++) for (let x = 0; x < w && !bad; x++) { if (D.lab[y * w + x] !== dId) continue; const c = (y + bb[1]) * W + x + bb[0];
+            if (solid[c]) { bad = true; break; }
+            for (let dy = -mg; dy <= mg && !bad; dy += mg) for (let dx = -mg; dx <= mg; dx += mg) { const k = c + dy * W + dx; if (k >= 0 && k < N && claim[k] && claim[k] !== id) { bad = true; break; } } }
+          if (bad) continue;
+          for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (D.lab[y * w + x] === dId) m[(y + bb[1]) * W + x + bb[0]] = 1;
+        }
+        const rects = maxRects(m, W, bb, Math.round(0.3 * ppm), 0.35 * ppm * ppm, 6);
+        if (rects.length) rooms.push({ id, rects, mask: m, bb, px: a });
+      });
+      roomAtPx = new Int32Array(N); rooms.forEach((r, n) => { for (let i = 0; i < N; i++) if (r.mask[i]) roomAtPx[i] = n + 1; });
+    }
+    // Проёмы: идём от каждой грани наружу, считаем пересечённые линии.
+    function findOps() {
+      ops = []; const ext = []; let solN = 0;
+      rooms.forEach((r, n) => r.rects.forEach((q) => {
+        [[0, q[1], q[0], q[2], -1, 'x'], [0, q[3] - 1, q[0], q[2], 1, 'x'], [1, q[0], q[1], q[3], -1, 'z'], [1, q[2] - 1, q[1], q[3], 1, 'z']].forEach(([vert, line, a, b, dir, axis]) => {
+          let cur = null; const flush = () => { if (cur) ops.push({ ...cur, axis, room: n, vert, dir, base: line, line: dir > 0 ? line + 1 : line, side: -dir }); cur = null; };
+          for (let s = a; s < b; s++) {
+            let cross = 0, inLine = false, to = null, inkN = 0, sol = 0;
+            for (let k = 1; k <= reach * 1.4; k++) {
+              const px = vert ? line + dir * k : s, py = vert ? s : line + dir * k; if (px < 0 || py < 0 || px >= W || py >= H) { to = 'out'; break; }
+              const c = py * W + px;
+              if (raw[c]) inkN++; if (solid[c]) sol = 1;
+              if (skel[c]) { if (!inLine) cross++; inLine = true; } else inLine = false;
+              const R = roomAtPx[c]; if (R === n + 1) { to = 'self'; break; } if (R) { to = R - 1; break; }
+              if (isOut(c)) { to = 'out'; break; }
+            }
+            let t = null;
+            if (typeof to === 'number') t = cross === 0 ? 'D' + to : cross >= 3 ? 'W' + to : null;
+            else if (to === 'out') { t = cross === 0 ? 'G' : 'E'; if (t === 'E') { ext.push(inkN); solN += sol; if (cur && cur.t === 'E') { cur.counts.push(inkN); cur.sols.push(sol); } } }
+            if (t && cur && cur.t === t) cur.to = s + 1; else { flush(); if (t) cur = { t, from: s, to: s + 1, counts: t === 'E' ? [inkN] : null, sols: t === 'E' ? [sol] : null }; }
+          }
+          flush();
+        });
+      }));
+      // Наружные стены: самая частая толщина линий — это стена, заметно другая — окно.
+      const hist = new Map(); ext.forEach((v) => hist.set(v, (hist.get(v) || 0) + 1));
+      let mode = 0, mc = 0; hist.forEach((c, v) => { const w = c + (hist.get(v - 1) || 0) + (hist.get(v + 1) || 0); if (w > mc) { mc = w; mode = v; } });
+      // если наружные стены залиты чёрным, окно — всё, где заливки нет
+      const byPier = solN >= 0.3 * ext.length && solN <= 0.9 * ext.length;
+      const dev = Math.max(2, mode * 0.35), hole = Math.round(0.1 * ppm), out = [];
+      ops.forEach((o) => {
+        if (o.t !== 'E') { out.push(o); return; }
+        let st = -1, gap = 0; const c = o.counts, push = (a, b) => { if (b - a >= 0.5 * ppm) out.push({ ...o, t: 'W', from: o.from + a, to: o.from + b, counts: null, sols: null }); };
+        for (let i = 0; i <= c.length; i++) {
+          const on = i < c.length && (byPier ? !o.sols[i] : Math.abs(c[i] - mode) >= dev);
+          if (on) { if (st < 0) st = i; gap = 0; } else if (st >= 0 && ++gap > hole) { push(st, i - gap + 1); st = -1; gap = 0; }
+        }
+        if (st >= 0) push(st, c.length - gap);
+      });
+      ops = out;
+    }
+    // Широкий проход без линий — это одно помещение; кусок, у которого проходы занимают большую часть контура, — тоже не комната.
+    function mergeOnce() {
+      const pairs = [];
+      ops.forEach((o) => { if (o.t[0] !== 'D') return; const w = (o.to - o.from) / ppm; if (w < 0.3) return;
+        const other = +o.t.slice(1), r = rooms[o.room], own = r.px / (ppm * ppm), perim = r.rects.reduce((v, q) => Math.max(v, 2 * (q[2] - q[0] + q[3] - q[1]) / ppm), 0);
+        const tot = ops.filter((x) => x.room === o.room && x.t[0] === 'D').reduce((v, x) => v + (x.to - x.from) / ppm, 0);
+        const doors = ops.filter((x) => x.room === o.room && (x.t[0] === 'D' || x.t === 'G') && (x.to - x.from) / ppm >= 0.5).length;
+        // кладовка и санузел — с одной дверью; маленький кусок с двумя проходами — часть коридора
+        if (w >= 1.0 || own < 1 || (own < 4.5 && doors >= 2) || (own < 3 && tot / perim >= 0.3)) pairs.push({ o, other, w, wide: w >= 1, nb: ops.filter((x) => x.room === other && x.t[0] === 'D' && (x.to - x.from) / ppm >= 0.5).length }); });
+      if (!pairs.length) return false;
+      pairs.sort((a, b) => (b.wide - a.wide) || b.nb - a.nb || b.w - a.w);
+      const { o, other } = pairs[0], A = rooms[o.room].id, B = rooms[other].id;
+      for (let i = 0; i < N; i++) if (claim[i] === A) claim[i] = B;
+      pairs.filter((p) => (p.o.room === o.room && p.other === other) || (p.o.room === other && p.other === o.room)).forEach(({ o: q }) => {
+        for (let s = q.from; s < q.to; s++) for (let k = 0; k <= reach; k++) {
+          const px = q.vert ? q.base + q.dir * k : s, py = q.vert ? s : q.base + q.dir * k, c = py * W + px;
+          if (px < 0 || py < 0 || px >= W || py >= H) break;
+          if (claim[c] && k > 0 && claim[c] === B) break;
+          claim[c] = B;
+        }
+      });
+      return true;
+    }
+    buildRooms(); findOps();
+    for (let g = 0; g < 12 && mergeOnce(); g++) { buildRooms(); findOps(); }
+    // Узкие помещения: карман за сантехникой (ванна, короб) принадлежит комнате, если до соседей есть место.
+    const claimed = (c) => claim[c] !== 0;
+    rooms.forEach((r) => {
+      if (r.px / (ppm * ppm) > 8 || r.rects.length !== 1) return;
+      const q = r.rects[0], wall = Math.round(0.14 * ppm), minDeep = Math.round(0.45 * ppm), maxDeep = Math.round(1.1 * ppm);
+      [[0, -1], [0, 1], [1, -1], [1, 1]].forEach(([vert, dir]) => {
+        const a = vert ? q[1] : q[0], b = vert ? q[3] : q[2], base = vert ? (dir < 0 ? q[0] : q[2] - 1) : (dir < 0 ? q[1] : q[3] - 1), ds = [];
+        for (let s = a; s < b; s += 2) { let k = 1; for (; k <= maxDeep + wall; k++) { const px = vert ? base + dir * k : s, py = vert ? s : base + dir * k; if (px < 0 || py < 0 || px >= W || py >= H) break; const c = py * W + px; if (claimed(c) && claim[c] !== r.id) break; if (solid[c] && dark[c] && k > wall) { k = Math.max(k, 1); break; } } ds.push(k); }
+        ds.sort((x, y) => x - y);
+        const low = ds[Math.floor(ds.length * 0.15)];
+        if (low - wall < minDeep || low > maxDeep + wall) return;
+        const ext = low - wall;
+        if (vert) { if (dir < 0) q[0] -= ext; else q[2] += ext; } else if (dir < 0) q[1] -= ext; else q[3] += ext;
+      });
+    });
+    return { W, H, ppm, box, rooms, ops, skel, ink, raw, claim };
+  }
+  // Перекос скана: угол, при котором линии складываются в самые резкие столбцы и строки.
+  function skewAngle(img) {
+    const W = img.width, H = img.height, pts = [], m = inkMask(img, 120);
+    for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (m[y * W + x]) pts.push(x, y);
+    if (pts.length > 240000) return 0;
+    let best = 0, bestV = -1;
+    for (let a = -4; a <= 4; a += 0.25) {
+      const t = a * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t), R0 = new Int32Array(W + H + 8), C0 = new Int32Array(W + H + 8);
+      for (let i = 0; i < pts.length; i += 2) { const x = pts[i], y = pts[i + 1]; const r = Math.round(y * cs + x * sn), c = Math.round(x * cs - y * sn) + H; if (r >= 0 && r < R0.length) R0[r]++; if (c >= 0 && c < C0.length) C0[c]++; }
+      let v = 0; for (let i = 0; i < R0.length; i++) v += R0[i] * R0[i] + C0[i] * C0[i];
+      if (v > bestV) { bestV = v; best = a; }
+    }
+    return best;
+  }
+  // Результат в формате планировки (метры, начало координат — угол картинки).
+  function toPlan(R) {
+    const { ppm, rooms, ops, W, H, ink, skel } = R, m = (v) => Math.round(v / ppm * 100) / 100, N = W * H;
+    const lineNear = dilate(skel, W, H, 2), loose = new Uint8Array(N); for (let i = 0; i < N; i++) loose[i] = ink[i] && !lineNear[i] ? 1 : 0;
+    const planRooms_ = rooms.map((r, n) => {
+      const areaPx = r.rects.reduce((a, q) => a + (q[2] - q[0]) * (q[3] - q[1]), 0); let fx = 0;
+      r.rects.forEach((q) => { for (let y = q[1]; y < q[3]; y++) for (let x = q[0]; x < q[2]; x++) if (loose[y * W + x]) fx++; });
+      return { id: 'r' + (n + 1), rects: r.rects.map((q) => q.map(m)), area: areaPx / (ppm * ppm), fx: fx / (areaPx / (ppm * ppm)) / ppm, doors: 0, glass: 0 };
+    });
+    const span = (o) => (o.to - o.from) / ppm, openings = [], seen = [];
+    let gaps = ops.filter((o) => o.t === 'G' && span(o) >= 0.6);
+    const entrance = gaps.filter((o) => span(o) < 1.25).sort((a, b) => Math.abs(span(a) - 0.9) - Math.abs(span(b) - 0.9))[0];
+    const leaf = (o) => {
+      const w = o.to - o.from; let best = { n: -1, side: o.side, hinge: 0 };
+      [1, -1].forEach((sd) => { let a = 0, b = 0;
+        for (let k = 3; k < w; k++) for (let s = o.from; s < o.to; s++) { const px = o.axis === 'z' ? o.line + sd * k : s, py = o.axis === 'z' ? s : o.line + sd * k; if (px < 0 || py < 0 || px >= W || py >= H) continue; if (loose[py * W + px] && k < w * 0.35) { if (s < o.from + w / 2) a++; else b++; } }
+        if (a + b > best.n) best = { n: a + b, side: sd, hinge: a >= b ? 0 : 1 }; });
+      return best.n >= 3 ? best : { side: o.side, hinge: 0 };
+    };
+    ops.forEach((o) => {
+      if (span(o) < 0.5) return;
+      const base = { axis: o.axis, line: m(o.line), from: m(o.from), to: m(o.to), side: o.side, hinge: 0, room: 'r' + (o.room + 1) }, c = (o.from + o.to) / 2;
+      if (o.t[0] === 'D') {
+        const other = +o.t.slice(1), key = Math.min(o.room, other) + ':' + Math.max(o.room, other);
+        if (seen.some((v) => v.key === key && Math.abs(v.c - c) < 0.5 * ppm)) return;
+        seen.push({ key, c }); planRooms_[o.room].doors++; planRooms_[other].doors++;
+        openings.push({ ...base, type: 'door', ...leaf(o), other });
+      } else if (o.t[0] === 'W') {
+        const other = o.t.length > 1 ? +o.t.slice(1) : -1;
+        if (other >= 0 && seen.some((v) => v.key === 'w' + Math.min(o.room, other) + ':' + Math.max(o.room, other) && Math.abs(v.c - c) < 0.5 * ppm)) return;
+        if (other >= 0) seen.push({ key: 'w' + Math.min(o.room, other) + ':' + Math.max(o.room, other), c });
+        planRooms_[o.room].glass += span(o);
+        openings.push({ ...base, type: 'window', sill: 0.8, other });
+      } else if (o === entrance) { openings.push({ ...base, type: 'entrance', ...leaf(o) }); planRooms_[o.room].doors++; }
+      else if (o.t === 'G' && span(o) >= 1.25) { planRooms_[o.room].glass += span(o); openings.push({ ...base, type: 'window', sill: 0.8, other: -1 }); }
+    });
+    let wc = 0, rm = 0;
+    planRooms_.forEach((r) => {
+      const short = Math.min(...r.rects.map((q) => Math.min(q[2] - q[0], q[3] - q[1])));
+      const longSide = Math.max(...r.rects.map((q) => Math.max(q[2] - q[0], q[3] - q[1])));
+      if (short < 1.75 && r.area < 8 && r.glass >= 0.5 * longSide && r.doors <= 1) { r.floor = 'deck'; r.name = 'Балкон'; }
+      else if (r.area < 7 && r.fx > 12 && r.doors <= 1) { r.floor = 'tile'; r.name = `Санузел ${++wc}`; }
+      else if (r.doors >= 3 || (r.doors >= 2 && r.area < 4.5)) { r.floor = 'wood'; r.name = 'Коридор'; }
+      else if (r.area < 3) { r.floor = 'wood'; r.name = 'Кладовая'; }
+      else { r.floor = 'wood'; r.name = `Комната ${++rm}`; }
+    });
+    // Куски коридора, разделённые только проходом, — одно помещение: перемычка закрывает зазор, проход между ними убирается.
+    const overlapGap = (a, b) => {
+      const gx = Math.max(a[0], b[0]) - Math.min(a[2], b[2]), gz = Math.max(a[1], b[1]) - Math.min(a[3], b[3]);
+      const ox = -gx, oz = -gz;
+      if (gx >= 0 && gx <= 0.35 && oz >= 0.5) return { gap: gx, rect: [Math.min(a[2], b[2]), Math.max(a[1], b[1]), Math.max(a[0], b[0]), Math.min(a[3], b[3])] };
+      if (gz >= 0 && gz <= 0.35 && ox >= 0.5) return { gap: gz, rect: [Math.max(a[0], b[0]), Math.min(a[3], b[3]), Math.min(a[2], b[2]), Math.max(a[1], b[1])] };
+      return null;
+    };
+    const dropped = new Set();
+    let drop = openings;
+    for (let go = true; go;) {
+      go = false;
+      for (let i = 0; i < planRooms_.length && !go; i++) for (let j = i + 1; j < planRooms_.length && !go; j++) {
+        const A = planRooms_[i], B = planRooms_[j];
+        if (dropped.has(j) || dropped.has(i) || A.name !== 'Коридор' || B.name !== 'Коридор') continue;
+        let best = null;
+        A.rects.forEach((a) => B.rects.forEach((b) => { const v = overlapGap(a, b); if (v && (!best || v.gap < best.gap)) best = v; }));
+        if (!best) continue;
+        const between = (o) => o.type === 'door' && ((o.room === A.id && o.other === j) || (o.room === B.id && o.other === i));
+        drop = drop.filter((o) => !between(o));
+        A.rects = [...A.rects, ...B.rects, ...(best.gap > 0 ? [best.rect] : [])]; A.area += B.area; A.doors += B.doors; dropped.add(j);
+        drop = drop.map((o) => {
+          const c = o.room === B.id ? { ...o, room: A.id } : o;
+          return c.other === j ? { ...c, other: i } : c;
+        });
+        go = true;
+      }
+    }
+    let halls = 0;
+    planRooms_.forEach((r, n) => { if (!dropped.has(n) && r.name === 'Коридор' && ++halls > 1) r.name = `Коридор ${halls}`; });
+    const clean = planRooms_.filter((r, n) => !dropped.has(n)).map(({ id, name, floor, rects }) => ({ id, name, floor, rects }));
+    const roomOf = (o) => planRooms_.find((r) => r.id === o.room);
+    const out = [];
+    drop.forEach((o) => {
+      const { other, ...c } = o, own = roomOf(c), deck = own.floor === 'deck' || (other >= 0 && planRooms_[other].floor === 'deck');
+      if (c.type === 'door' && other !== undefined && deck) c.type = 'balcony';
+      if (c.type === 'window') {
+        // Окно между двумя комнатами и короткий обрывок — это линии мебели, а не окно.
+        if (other >= 0 && !deck) return;
+        if (c.to - c.from < 0.7) return;
+        // Линии рамы часто тянутся на всю стену: у комнаты оставляем простенки, на балконе остекление сплошное.
+        if (!deck) {
+          const wall = own.rects.filter((q) => (c.axis === 'x' ? [q[1], q[3]] : [q[0], q[2]]).some((e) => Math.abs(e - c.line) < 0.02)).reduce((v, q) => Math.max(v, c.axis === 'x' ? q[2] - q[0] : q[3] - q[1]), 0);
+          const w = c.to - c.from, top = wall * 0.7;
+          if (wall > 0 && w > top) { const mid = (c.from + c.to) / 2; c.from = Math.round((mid - top / 2) * 100) / 100; c.to = Math.round((mid + top / 2) * 100) / 100; }
+        }
+      }
+      out.push(c);
+    });
+    return { rooms: clean, openings: out };
+  }
+  return { run, skewAngle, toPlan };
+})();
+
 /* ------------------------------------------------------------------ редактор планировки */
 {
 const FLOOR_NAMES = { wood: 'Ламинат', tile: 'Плитка', deck: 'Балкон' };
 const OP_NAMES = { window: 'Окно', door: 'Дверь', balcony: 'Балконная дверь', entrance: 'Входная дверь' };
 const OP_WIDTH = { window: 1.5, door: 0.8, balcony: 0.75, entrance: 0.9 };
 const TOOL_HINT = {
-  select: 'Нажмите на комнату, чтобы выбрать и двигать. Края тянутся, размеры вписываются слева. Колесо — масштаб, перетаскивание пустого места — сдвиг плана.',
+  select: 'Нажмите на комнату или проём, чтобы выбрать и двигать. Края тянутся, размеры вписываются слева. Колесо — масштаб, перетаскивание пустого места — сдвиг плана.',
   room: 'Растяните прямоугольник по внутренним стенам комнаты. Края прилипают к соседним комнатам с зазором на перегородку.',
   part: 'Растяните прямоугольник, примыкающий к выбранной комнате: так получится Г-образная комната, ниша или выступ.',
   window: 'Нажмите на стену комнаты там, где находится окно.',
@@ -3868,6 +4222,12 @@ function buildDom() {
         <button type="button" class="btn" id="peRot">Повернуть 90°</button>
         <button type="button" class="btn" data-tool="image">Двигать</button>
         <button type="button" class="btn danger" id="peImgDel">Убрать</button>
+      </div>
+      <div id="peRecogBox" hidden class="editor">
+        <b>Распознать план автоматически</b>
+        <label class="field"><span>Площадь всех помещений по плану, м²</span><input type="number" id="peRecogArea" min="5" max="1000" step="0.1"></label>
+        <button type="button" class="btn primary" id="peRecog">Распознать стены, окна и двери</button>
+        <small class="note">Нужна для масштаба. Файл никуда не отправляется: всё считается в этом браузере. Результат можно поправить вручную.</small>
       </div>
       <div id="peScaleBox" hidden class="pe-grid" style="align-items:end">
         <label class="field"><span>Расстояние, мм</span><input type="number" id="peScaleLen" min="1" step="1"></label>
@@ -4218,7 +4578,9 @@ function renderInsp() {
       <div class="pe-grid">${field('Ширина →, мм', 'w' + j, mmOf(r[2] - r[0]), 'min="100" step="1"')}${field('Глубина ↓, мм', 'd' + j, mmOf(r[3] - r[1]), 'min="100" step="1"')}
       ${field('Левый край X, мм', 'x' + j, mmOf(r[0]), 'step="1"')}${field('Верхний край Z, мм', 'z' + j, mmOf(r[1]), 'step="1"')}</div>
       ${rm.rects.length > 1 ? `<div class="btnrow"><button type="button" class="btn danger" data-a="delpart" data-j="${j}">Удалить часть</button></div>` : ''}</div>`).join('')}
-    <div class="btnrow"><button type="button" class="btn" data-tool="part">Добавить часть</button><button type="button" class="btn danger" data-a="delroom">Удалить комнату</button></div>`;
+    <div class="btnrow"><button type="button" class="btn" data-tool="part">Добавить часть</button><button type="button" class="btn danger" data-a="delroom">Удалить комнату</button></div>
+    ${E.plan.rooms.length > 1 ? `<label class="field"><span>Объединить с помещением</span><select data-f="merge"><option value="">Выбрать…</option>${E.plan.rooms.map((m, i) => (i === E.sel.room ? '' : `<option value="${i}">${esc(m.name)}</option>`)).join('')}</select></label>` : ''}
+    ${E.plan.auto && rm.area ? '<button type="button" class="btn" data-a="fitarea">Подогнать масштаб всего плана под площадь этой комнаты</button>' : ''}`;
   box.querySelector('[data-f="name"]').value = rm.name;
 }
 function renderRooms() {
@@ -4280,6 +4642,13 @@ function applyField(f, raw) {
   const rm = P.rooms[E.sel.room]; if (!rm) return;
   if (f === 'name') { rm.name = raw; renderRooms(); return; }
   if (f === 'floor') { rm.floor = raw; return; }
+  if (f === 'merge') {
+    const other = P.rooms[+raw]; if (!other) return;
+    // ошибка распознавания: одна комната определилась как две
+    remember(); other.rects.push(...rm.rects);
+    P.openings.forEach((o) => { if (o.room === rm.id) o.room = other.id; });
+    P.rooms.splice(E.sel.room, 1); E.sel = { room: P.rooms.indexOf(other), rect: 0 }; renderInsp(); renderRooms(); return;
+  }
   if (f === 'area' || f === 'perimeter') { if (num > 0) rm[f] = num; else delete rm[f]; renderRooms(); return; }
   const j = parseInt(f.slice(1), 10), r = rm.rects[j]; if (!r || !isFinite(num)) return;
   if (f[0] === 'w' && num >= 100) setEdge(rm, r, 'x1', r[0] + mm);
@@ -4298,7 +4667,8 @@ function applyField(f, raw) {
 }
 function renderImgBox() {
   const m = E.img;
-  q('#peImgBox').hidden = !m; q('#peScaleBtn').disabled = !m;
+  q('#peImgBox').hidden = !m; q('#peScaleBtn').disabled = !m; q('#peRecogBox').hidden = !m;
+  if (m && !q('#peRecogArea').value) q('#peRecogArea').value = 70;
   if (m) q('#peOpacity').value = m.opacity;
   q('#pePageBox').hidden = !E.pdf;
   if (E.pdf) { q('#pePage').max = E.pdf.numPages; q('#pePage').value = E.pdfPage || 1; }
@@ -4317,8 +4687,8 @@ function setImage(canvasOrImg, w, h) {
   el.onload = () => {
     const old = E.img;
     E.img = { src, el, x: old ? old.x : 0, z: old ? old.z : 0, mpp: old ? old.mpp : 12 / c.width, rot: old ? old.rot : 0, opacity: old ? old.opacity : 0.6 };
-    saveImg(); renderImgBox(); fit(); setTool('scale');
-    status_(old ? '' : 'Теперь задайте масштаб: отметьте две точки с известным расстоянием.');
+    saveImg(); renderImgBox(); fit(); draw();
+    status_(old ? '' : 'Впишите площадь и нажмите «Распознать» или обведите комнаты вручную.');
   };
   el.src = src;
 }
@@ -4352,6 +4722,42 @@ async function loadFile(file) {
     }
   } catch (e) { status_('Не получилось открыть файл. Сохраните план как картинку (PNG или JPEG) и загрузите её.', true); }
 }
+// Картинка → рабочий холст: поворот подложки и выравнивание перекоса, затем распознавание.
+function recognizeImage() {
+  const area = parseFloat(q('#peRecogArea').value);
+  if (!(area >= 5)) { status_('Впишите площадь из плана: без неё не определить масштаб.', true); return; }
+  const m = E.img, nw = m.el.naturalWidth, nh = m.el.naturalHeight, k = Math.min(1, 1500 / Math.max(nw, nh));
+  const swap = m.rot % 2 === 1, cw = Math.round((swap ? nh : nw) * k), ch = Math.round((swap ? nw : nh) * k);
+  const paint = (deg) => {
+    const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+    const x = c.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, cw, ch);
+    x.translate(cw / 2, ch / 2); x.rotate((m.rot * 90 + deg) * Math.PI / 180); x.scale(k, k); x.drawImage(m.el, -nw / 2, -nh / 2);
+    return { c, x };
+  };
+  let w = paint(0);
+  const ang = Recog.skewAngle(w.x.getImageData(0, 0, cw, ch));
+  if (Math.abs(ang) >= 0.25) w = paint(-ang);
+  let R, P;
+  try {
+    R = Recog.run(w.x.getImageData(0, 0, cw, ch), area);
+    P = Recog.toPlan(R);
+  } catch (e) { status_('Не получилось разобрать план. Обведите комнаты вручную.', true); return; }
+  if (!P.rooms.length) { status_('Комнаты не нашлись: нужен чёткий чертёж с замкнутыми стенами. Обведите комнаты вручную.', true); return; }
+  remember();
+  E.plan.rooms = P.rooms; E.plan.openings = P.openings; E.plan.auto = true; E.sel = null;
+  // распознанный вид становится подложкой, чтобы комнаты совпали с ней
+  const src = w.c.toDataURL('image/jpeg', 0.8), el = new Image();
+  el.onload = () => { E.img = { src, el, x: 0, z: 0, mpp: 1 / R.ppm, rot: 0, opacity: E.img.opacity }; saveImg(); fit(); renderImgBox(); draw(); };
+  el.src = src;
+  const nDoor = P.openings.filter((o) => o.type !== 'window').length, nWin = P.openings.filter((o) => o.type === 'window').length;
+  setTool('select'); renderInsp(); renderRooms(); touch();
+  status_(`Найдено: помещений ${P.rooms.length}, дверей ${nDoor}, окон ${nWin}. Сверьте с подложкой и поправьте, что не совпало.`);
+}
+function scaleAll(k) {
+  E.plan.rooms.forEach((rm) => { rm.rects = rm.rects.map((r) => r.map((v) => Math.round(v * k * 1000) / 1000)); });
+  E.plan.openings.forEach((o) => { o.line *= k; o.from *= k; o.to *= k; });
+  if (E.img) { E.img.x *= k; E.img.z *= k; E.img.mpp *= k; saveImg(); }
+}
 function build() {
   const { errs } = checks(); if (errs.length) return;
   let p;
@@ -4374,6 +4780,7 @@ function bindDom() {
         case 'hinge': o.hinge = o.hinge ? 0 : 1; break;
         case 'side': o.side = -o.side; break;
         case 'delop': P.openings.splice(E.sel.op, 1); E.sel = null; break;
+        case 'fitarea': { const rm = P.rooms[E.sel.room]; scaleAll(Math.sqrt(rm.area / rectStats(rm.rects).area)); fit(); break; }
         case 'delpart': { const rm = P.rooms[E.sel.room]; rm.rects.splice(+a.dataset.j, 1); E.sel.rect = 0; break; }
         case 'delroom': { const rm = P.rooms[E.sel.room]; P.openings = P.openings.filter((x) => x.room !== rm.id); P.rooms.splice(E.sel.room, 1); E.sel = null; break; }
       }
@@ -4404,9 +4811,11 @@ function bindDom() {
     const L = parseFloat(q('#peScaleLen').value) / 1000, A = E.scaleA, B = E.scaleB;
     if (!(L > 0) || !A || !B) { status_('Впишите расстояние в миллиметрах.', true); return; }
     const cur = Math.hypot(B.x - A.x, B.z - A.z); if (cur < 1e-6) return;
-    const k = L / cur, m = E.img; m.x = A.x + (m.x - A.x) * k; m.z = A.z + (m.z - A.z) * k; m.mpp *= k;
+    const k = L / cur, m = E.img;
+    if (E.plan.auto) { remember(); scaleAll(k); renderInsp(); renderRooms(); touch(); } else { m.x = A.x + (m.x - A.x) * k; m.z = A.z + (m.z - A.z) * k; m.mpp *= k; }
     saveImg(); setTool(E.plan.rooms.length ? 'select' : 'room'); fit(); status_('Масштаб задан.'); draw();
   });
+  q('#peRecog').addEventListener('click', recognizeImage);
   q('#peBuild').addEventListener('click', build);
   q('#peUndo').addEventListener('click', undo);
   q('#peExport').addEventListener('click', async () => {
